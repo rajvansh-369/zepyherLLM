@@ -1,0 +1,58 @@
+# Zephyr 7B local chat runner -- runtime dependencies.
+#
+#   pip install -r requirements.txt
+#
+# CUDA: torch on PyPI ships the CPU build on Windows. For the GPU path -- which
+# is the only one that answers at a usable speed -- install torch first from the
+# wheel index matching your driver, then run the line above:
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# Verified against Python 3.11.9 with torch 2.5.1+cu121 on a 6 GB card.
+# Floors are set at the release that introduced something the code actually
+# uses; upper bounds stop at the next major, where those APIs may move.
+
+
+# --- inference ------------------------------------------------------------
+
+# 2.1 for scaled_dot_product_attention (attn_implementation="sdpa"),
+# torch.cuda.OutOfMemoryError and torch.cuda.is_bf16_supported.
+torch>=2.1,<3
+
+# 4.56 renamed from_pretrained's torch_dtype argument to dtype, which llm.py
+# passes. DynamicCache.crop -- what reuse_cache() relies on to keep the shared
+# prefix when history is rewritten -- has been there since 4.38.
+transformers>=4.56,<5
+
+# Not imported directly, but transformers requires it for device_map and
+# low_cpu_mem_usage, i.e. for placing the model on the GPU at all.
+accelerate>=0.26,<2
+
+# The 4-bit NF4 path. Anything under 16 GB of VRAM loads through this, so on a
+# small card it is not optional. 0.43 is the first release with official
+# Windows wheels.
+bitsandbytes>=0.43,<1
+
+# snapshot_download with local_dir resume, and the HF_HUB_DISABLE_XET switch
+# llm.py sets before importing it.
+huggingface-hub>=0.30,<1
+
+
+# --- memory ---------------------------------------------------------------
+
+# The vector index is a plain float32 matrix and a matmul, so numpy is the
+# whole of it. 2.x is what sentence-transformers 5 is built against.
+numpy>=1.24,<3
+
+# Encoder for recall. memory.py falls back to hashed n-grams if this is
+# missing, which keeps the runner working offline on first start, but recall
+# is markedly worse -- paraphrases stop matching.
+sentence-transformers>=3.0,<6
+
+
+# --- live web lookup ------------------------------------------------------
+
+# Imported lazily inside fetch_context, so its absence degrades to "answer
+# from the weights" rather than a crash. The package was renamed from
+# duckduckgo-search at 9.0, which is the name retrieval.py imports.
+ddgs>=9.0,<10
