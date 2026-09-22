@@ -117,6 +117,65 @@ a typo'd `/good` does not silently become a question.
 
 ---
 
+## HTTP API
+
+`api.py` serves the same pipeline -- web lookup, memory recall, notes,
+learning -- over an OpenAI-compatible HTTP API.
+
+```bash
+python api.py                              # http://127.0.0.1:8000
+python api.py --host 0.0.0.0 --port 8080   # set ZYPHER_API_KEY first
+```
+
+The server starts answering straight away; `/health` reports `loading` until
+the model is up, and chat calls return 503 until then.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="unused")
+reply = client.chat.completions.create(
+    model="zephyr-7b",
+    messages=[{"role": "user", "content": "Who won the match last night?"}],
+    stream=True,
+)
+```
+
+| Endpoint | Does |
+|---|---|
+| `GET /health` | load state, device, budgets, memory stats (no auth) |
+| `GET /v1/models` | the one model |
+| `POST /v1/chat/completions` | answer; `stream: true` for server-sent events |
+| `GET /v1/memory` | memory stats and the notes in the system prompt |
+| `GET /v1/memory/records?kind=note\|exchange` | stored records, newest first |
+| `POST /v1/memory/notes` | `{"text": ...}` -- same as `/remember` |
+| `POST /v1/memory/{id}/rate` | `{"rating": "good"\|"bad"}` -- same as `/good` / `/bad` |
+| `DELETE /v1/memory?selector=last\|all\|<text>` | same as `/forget` |
+| `PATCH /v1/settings` | `{"web": bool, "memory": bool}` server defaults |
+
+Chat requests take the usual `messages`, `max_tokens`, `temperature`,
+`top_p` and `stream`, plus:
+
+- `web`: `"auto"` (default, the router decides), `true` (force a lookup), `false`
+- `memory`: recall and learn on this request; defaults to the server setting
+- `sampling`: `precise`, `balanced` or `creative`, instead of the per-question pick
+
+The response carries a `zypher` object with the cited `sources`, how many
+memories were recalled, notes captured, and the `memory_id` of the stored
+exchange -- pass that to `/rate`. When streaming it arrives on the last chunk.
+
+A client system message is appended to the runner's own system prompt, not
+swapped in for it. Ending `messages` with a partial assistant message continues
+that reply, like `continue` in the console. `max_tokens` is capped at the
+answer budget.
+
+Requests are served one at a time -- one model, one GPU. Disconnecting mid-
+stream stops the generation at the next token. Set `ZYPHER_API_KEY` to require
+`Authorization: Bearer <key>`; without it, anyone who can reach the port can
+use the model and read its memory.
+
+---
+
 ## Self-learning
 
 There is no fine-tuning here and no training step. The model learns the way a
@@ -251,6 +310,7 @@ All at the top of each file.
 ## Files
 
 ```
+api.py            OpenAI-compatible HTTP API over the same pipeline
 llm.py            model download + verification, loading, generation, chat loop
 memory.py         persistent semantic memory and the feedback loop
 retrieval.py      live web lookup: routing, fetching, grounding

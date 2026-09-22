@@ -61,3 +61,11 @@ sentence-transformers>=3.0,<6
 # from the weights" rather than a crash. The package was renamed from
 # duckduckgo-search at 9.0, which is the name retrieval.py imports.
 ddgs>=9.0,<10
+
+
+# --- HTTP API (api.py) ----------------------------------------------------
+
+# Only needed to serve the model over HTTP; llm.py runs without them.
+# 0.100 is the first FastAPI on pydantic 2, which the request models use.
+fastapi>=0.100,<1
+uvicorn>=0.23,<1
