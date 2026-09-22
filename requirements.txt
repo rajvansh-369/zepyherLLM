@@ -20,9 +20,9 @@
 # torch.cuda.OutOfMemoryError and torch.cuda.is_bf16_supported.
 torch>=2.1,<3
 
-# 4.56 renamed from_pretrained's torch_dtype argument to dtype, which llm.py
+# 4.56 renamed from_pretrained's torch_dtype argument to dtype, which the loader
 # passes. DynamicCache.crop -- what reuse_cache() relies on to keep the shared
-# prefix when history is rewritten -- has been there since 4.38; llm.py calls
+# prefix when history is rewritten -- has been there since 4.38; generation.py calls
 # it with a negative count, the form 4.x and 5.x both accept. 5.x is allowed:
 # prompts are encoded from the rendered template rather than through
 # apply_chat_template(tokenize=True), whose return type 5.0 changed.
@@ -38,7 +38,7 @@ accelerate>=0.26,<2
 bitsandbytes>=0.43,<1
 
 # snapshot_download with local_dir resume, and the HF_HUB_DISABLE_XET switch
-# llm.py sets before importing it. 1.x keeps both, and the download sidecar
+# zypher/__init__.py sets before importing it. 1.x keeps both, and the download sidecar
 # format verify_model_files reads; transformers 5 requires it.
 huggingface-hub>=0.30,<2
 
@@ -49,7 +49,7 @@ huggingface-hub>=0.30,<2
 # whole of it. 2.x is what sentence-transformers 5 is built against.
 numpy>=1.24,<3
 
-# Encoder for recall. memory.py falls back to hashed n-grams if this is
+# Encoder for recall. zypher/model/memory.py falls back to hashed n-grams if this is
 # missing, which keeps the runner working offline on first start, but recall
 # is markedly worse -- paraphrases stop matching.
 sentence-transformers>=3.0,<6
@@ -59,13 +59,13 @@ sentence-transformers>=3.0,<6
 
 # Imported lazily inside fetch_context, so its absence degrades to "answer
 # from the weights" rather than a crash. The package was renamed from
-# duckduckgo-search at 9.0, which is the name retrieval.py imports.
+# duckduckgo-search at 9.0, which is the name zypher/model/retrieval.py imports.
 ddgs>=9.0,<10
 
 
-# --- HTTP API (api.py) ----------------------------------------------------
+# --- HTTP API (python main.py serve) ----------------------------------------
 
-# Only needed to serve the model over HTTP; llm.py runs without them.
+# Only needed to serve the model over HTTP; the console chat runs without them.
 # 0.100 is the first FastAPI on pydantic 2, which the request models use.
 fastapi>=0.100,<1
 uvicorn>=0.23,<1

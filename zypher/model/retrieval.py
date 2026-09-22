@@ -15,36 +15,19 @@ import datetime
 import re
 from urllib.parse import urlparse
 
+from zypher.config import (
+    CONTEXT_CHAR_BUDGET,
+    FETCH_RESULTS,
+    MAX_RESULTS,
+    REGION,
+    SNIPPET_CHAR_BUDGET,
+    TIME_LIMIT,
+)
+
 
 # ============================================================
-# CONFIG
+# ROUTING PATTERNS
 # ============================================================
-
-# How many search hits to keep. A 7B reading four snippets answers better than
-# the same 7B reading twenty: past a handful it starts blending sources
-# together instead of picking one.
-MAX_RESULTS = 4
-
-# How many to ask the backend for. Some hits come back with no body, and some
-# are a second copy of a page already kept, so asking for exactly MAX_RESULTS
-# regularly left the model with two or three.
-FETCH_RESULTS = 8
-
-# Hard ceiling on the injected block. ~3000 characters is roughly 750 tokens,
-# which is a fifth of the 4096-token prompt budget a small card runs with.
-CONTEXT_CHAR_BUDGET = 3000
-
-# Per-snippet cap, applied before the global one, so a single verbose result
-# cannot crowd the other three out.
-SNIPPET_CHAR_BUDGET = 600
-
-# Restrict results to the last month by default: "d" (day), "w", "m", "y", or
-# None for no limit. The whole point is freshness, and an undated hit from
-# 2021 is exactly the failure this module exists to avoid. Lifted for a
-# question about an explicit past year -- see _time_limit_for.
-TIME_LIMIT = "m"
-
-REGION = "us-en"
 
 # Phrases that make an answer depend on when it is asked. Matched as whole
 # words: as bare substrings "now" fired inside "know", "score" inside

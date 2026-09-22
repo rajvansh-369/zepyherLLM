@@ -34,61 +34,28 @@ import zlib
 
 import numpy as np
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-MEMORY_DIR = os.environ.get(
-    "ZYPHER_MEMORY_DIR",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".memory"),
+from zypher.config import (
+    ANSWER_CHAR_BUDGET,
+    DEDUPE_THRESHOLD,
+    EMBED_MODEL,
+    MEMORY_DIR,
+    META_FILE,
+    PROFILE_CHAR_BUDGET,
+    PROFILE_MAX_NOTES,
+    RECALL_CANDIDATES,
+    RECALL_CHAR_BUDGET,
+    RECALL_KEEP,
+    RECALL_THRESHOLD,
+    RECORDS_FILE,
+    SCORE_CLAMP,
+    SCORE_WEIGHT,
+    VECTORS_FILE,
 )
 
-RECORDS_FILE = "memory.jsonl"
-VECTORS_FILE = "vectors.npy"
-META_FILE = "meta.json"
 
-# Small, fast, and good enough for "have I been asked this before". 384 dims,
-# ~80 MB, runs on CPU in a few milliseconds per turn.
-EMBED_MODEL = os.environ.get(
-    "ZYPHER_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-)
-
-# How many memories to consider, and how many survive into the prompt.
-RECALL_CANDIDATES = 12
-RECALL_KEEP = 3
-
-# Cosine similarity below this is noise. Injecting a loosely related old
-# answer is worse than injecting nothing: the model treats whatever is in the
-# prompt as relevant and will work it into the reply. Measured with MiniLM, a
-# paraphrase of a stored question scores ~0.8, a follow-up on the same topic
-# ~0.45, the same operation in another language ~0.37, and a different
-# question in the same language ~0.2.
-RECALL_THRESHOLD = 0.42
-
-# The profile of notes placed in the system prompt. Kept to the most recent
-# few: the system prompt heads every turn, so each character here is paid for
-# on all of them, and its text has to stay stable between turns for the KV
-# cache of everything after it to be reused.
-PROFILE_MAX_NOTES = 8
-PROFILE_CHAR_BUDGET = 600
-
-# Hard ceiling on the injected block, in characters. ~1200 chars is ~300
-# tokens, which sits alongside the web context without crowding it out.
-RECALL_CHAR_BUDGET = 1200
-
-# Per-memory cap, so one long answer cannot fill the block on its own.
-ANSWER_CHAR_BUDGET = 400
-
-# A rating nudges ranking without letting a single thumbs-up outrank a much
-# closer match.
-SCORE_WEIGHT = 0.04
-SCORE_CLAMP = 3
-
-# Notes this similar to one already stored are the same note; the new wording
-# replaces the old one instead of adding a near-duplicate row. Exchanges are
-# deduplicated on the question text instead -- see _find_duplicate.
-DEDUPE_THRESHOLD = 0.94
+# ============================================================
+# NOTE CAPTURE
+# ============================================================
 
 # Sentences that state something durable about the user. Captured as notes so
 # they survive 'clear', which a plain exchange does not: exchanges are only
