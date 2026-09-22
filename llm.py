@@ -6,9 +6,12 @@ card cannot hold it in bf16, and the weights are checksummed before use
 rather than assumed good because config.json happens to be on disk.
 """
 
+import datetime
 import hashlib
+import importlib.util
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -39,6 +42,20 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+# transformers imports torchaudio whenever it is installed, including on the
+# way to loading a text-only model. One built for an older torch -- left behind
+# when something upgraded torch -- fails to load its DLL with an OSError, and
+# the model cannot be loaded at all. Nothing here uses audio, so a torchaudio
+# that will not import is marked absent, and transformers skips it.
+if importlib.util.find_spec("torchaudio") is not None:
+    try:
+        importlib.import_module("torchaudio")
+    except Exception as error:
+        sys.modules["torchaudio"] = None
+        print("[ignoring torchaudio, which failed to import: {}]".format(
+            type(error).__name__
+        ))
+
 import torch
 
 from huggingface_hub import snapshot_download
@@ -46,6 +63,10 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    LogitsProcessor,
+    LogitsProcessorList,
+    StoppingCriteria,
+    StoppingCriteriaList,
     TextIteratorStreamer,
 )
 
@@ -70,12 +91,37 @@ MODEL_NAME = "richardyoung/zephyr-7b-beta-abliterated"
 # Change this to your required location
 MODEL_PATH = r"C:\AI\Models\zephyr-7b-beta-abliterated"
 
+# The standing instructions. A 7B follows short, concrete rules far better
+# than general exhortations ("be accurate"), and it follows the format it is
+# shown: the rules below are what turns a wall of prose into a direct answer
+# followed by headings, lists and fenced code. system_prompt() adds today's
+# date and what is known about the user.
 SYSTEM_PROMPT = (
-    "You are a helpful AI assistant. "
-    "Give accurate answers. "
-    "When asked for code, output the complete file -- every tag, every rule, "
+    "You are a knowledgeable, precise and helpful AI assistant.\n"
+    "\n"
+    "Accuracy:\n"
+    "- Answer exactly what was asked. Give the direct answer first, then the "
+    "explanation.\n"
+    "- If you are not sure, say so. Never invent facts, numbers, quotes, "
+    "sources, links or API names.\n"
+    "- Your knowledge comes from training data that ends in 2023. For anything "
+    "that may have changed since, say that your information may be out of "
+    "date.\n"
+    "- For maths and multi-step problems, work through the steps, then give "
+    "the final result on its own line.\n"
+    "\n"
+    "Format (Markdown):\n"
+    "- Match the length to the question: a simple question gets one to three "
+    "sentences and no headings.\n"
+    "- For longer answers, use ## headings for separate parts, numbered lists "
+    "for steps, bullet points for options, and a table to compare things.\n"
+    "- Use **bold** only for the key term or the final answer.\n"
+    "- Put code in fenced blocks that name the language, like ```python.\n"
+    "- When asked for code, output the complete file -- every tag, every rule, "
     "closed and runnable. Never abbreviate with a placeholder such as "
-    "'... rest of the code ...' and never stop early to save space."
+    "'... rest of the code ...' and never stop early to save space.\n"
+    "- No filler: do not open with \"Sure!\" or \"Great question\", and do not "
+    "repeat the question back."
 )
 
 # Generation
@@ -85,12 +131,28 @@ SYSTEM_PROMPT = (
 # below is the budget for one generate() call; MAX_TOTAL_NEW_TOKENS is the
 # budget for an answer, which auto-continue may spread over several calls.
 MAX_NEW_TOKENS = 2048
-TEMPERATURE = 0.7
-TOP_P = 0.9
+
+# Sampling is chosen per question -- see pick_sampling. Code, maths and
+# questions of fact want the most likely continuation: at 0.7 a 7B misspells
+# API names and drifts off the figures in its sources. Stories and
+# brainstorming read flat much below 0.8. min_p drops every token far less
+# likely than the best one, which stops a sampled answer wandering into
+# nonsense without flattening its word choice the way a low top_p does.
+SAMPLING = {
+    "precise": {"temperature": 0.3, "top_p": 0.9, "min_p": 0.05},
+    "balanced": {"temperature": 0.6, "top_p": 0.9, "min_p": 0.05},
+    "creative": {"temperature": 0.85, "top_p": 0.95, "min_p": 0.05},
+}
 
 # Kept mild. A higher penalty actively damages code, where repeated tokens
-# (closing tags, indentation, repeated property names) are correct.
+# (closing tags, indentation, repeated property names) are correct. Applied
+# to the answer's own tokens only -- see GeneratedRepetitionPenalty.
 REPETITION_PENALTY = 1.05
+
+# Zephyr's role markers. The model occasionally writes one instead of ending
+# its turn and goes on to invent the user's next message; generation stops at
+# the marker, and it never reaches the screen or the stored answer.
+STOP_STRINGS = ("<|user|>", "<|system|>", "<|assistant|>")
 
 # Prompt tokens kept before the oldest turns are dropped. Bounds the KV
 # cache, which is what actually runs a small GPU out of memory mid-chat.
@@ -123,9 +185,10 @@ FOURBIT_VRAM_REQUIRED_GB = 5.0
 # with '/web'.
 RETRIEVAL_ENABLED = True
 
-# Past exchanges and stated preferences are recalled by similarity and placed
-# in the prompt, so the runner gets better at this particular user without the
-# weights ever changing. Toggle at runtime with '/memory'.
+# Past exchanges are recalled by similarity and placed in the prompt, and
+# stated preferences go into the system prompt, so the runner gets better at
+# this particular user without the weights ever changing. Toggle at runtime
+# with '/memory'.
 MEMORY_ENABLED = True
 
 # Streaming a token at a time means a flush per token, and each console flush
@@ -579,16 +642,16 @@ def load_model():
 
     model.eval()
 
-    # Sampling parameters live on the model's generation config instead of
-    # being rebuilt into a kwargs dict on every call. transformers validates
-    # and copies that config once per generate(); settings that never change
-    # do not need to be re-supplied and re-validated each round.
+    # Settings that never change live on the model's generation config. The
+    # ones chosen per question -- temperature, top_p, min_p -- are passed to
+    # each generate() call instead.
+    #
+    # The built-in repetition penalty stays off: it counts the prompt too.
+    # GeneratedRepetitionPenalty applies the same penalty to the answer alone.
     config = model.generation_config
     config.use_cache = True
     config.do_sample = True
-    config.temperature = TEMPERATURE
-    config.top_p = TOP_P
-    config.repetition_penalty = REPETITION_PENALTY
+    config.repetition_penalty = 1.0
 
     if plan != "cpu":
         assert_fully_on_gpu(model)
@@ -616,12 +679,17 @@ def warm_up(tokenizer, model):
 
     ids = tokenizer("hi", return_tensors="pt").input_ids.to(model.device)
 
+    # The stop strings go through here too: transformers precomputes, once
+    # per tokenizer, which vocabulary entries could complete each one, and
+    # that scan of the vocabulary is otherwise paid inside the first answer.
     with torch.inference_mode():
         model.generate(
             input_ids=ids,
             attention_mask=torch.ones_like(ids),
             max_new_tokens=2,
             pad_token_id=tokenizer.pad_token_id,
+            stop_strings=list(STOP_STRINGS),
+            tokenizer=tokenizer,
             use_cache=True,
         )
 
@@ -675,30 +743,125 @@ def assert_fully_on_gpu(model):
 # PROMPT BUILDING
 # ============================================================
 
+def system_prompt(notes=()):
+    """SYSTEM_PROMPT plus today's date and what is known about the user.
+
+    The date is stated on every turn, not only on the ones that searched the
+    web: without it the model reasons from its training year and gets ages,
+    durations and "how long ago" wrong.
+
+    The notes go here rather than into the user turn. A preference applies to
+    every question, including the many it does not resemble, and text at the
+    head of the prompt stays in the KV cache instead of being read again on
+    each turn. Its wording must therefore stay stable from turn to turn.
+    """
+
+    parts = [
+        SYSTEM_PROMPT,
+        "",
+        "Today's date is {}.".format(datetime.date.today().strftime("%d %B %Y")),
+    ]
+
+    if notes:
+        parts.append("")
+        parts.append(
+            "What you know about the user -- follow their stated preferences, "
+            "and use the facts only where they are relevant:"
+        )
+        parts.extend("- {}".format(note) for note in notes)
+
+    return "\n".join(parts)
+
+
+_BOS_CACHE = {}
+
+
+def _wants_bos(tokenizer):
+    """Whether this tokenizer's own encoding starts with BOS.
+
+    Asked of what the tokenizer does rather than of its add_bos_token
+    attribute, which transformers 5 reports as False for this model while
+    encoding still prepends <s>.
+    """
+
+    key = id(tokenizer)
+
+    if key not in _BOS_CACHE:
+        bos = tokenizer.bos_token_id
+        probe = tokenizer("a").input_ids if bos is not None else []
+        _BOS_CACHE[key] = bool(probe) and probe[0] == bos
+
+    return _BOS_CACHE[key]
+
+
+def encode(tokenizer, text):
+    """Token ids for rendered chat text, with the BOS the template leaves out.
+
+    Zephyr's template never writes <s>, and apply_chat_template(tokenize=True)
+    encodes without special tokens, so every prompt went in without the BOS
+    the model saw at the head of every training sequence. Mistral-family
+    models use that first position as an attention sink; without it answers
+    wander more and end less cleanly. A template that writes its own BOS
+    (Llama 3, Mistral Instruct) is left alone, so a model swap does not
+    double it.
+
+    Encoding the rendered text here, rather than asking apply_chat_template
+    to, also sidesteps its return type: transformers 5 returns a BatchEncoding
+    where 4.x returned a tensor, and ids.shape then raised AttributeError on
+    every turn.
+    """
+
+    ids = tokenizer(text, add_special_tokens=False, return_tensors="pt").input_ids
+
+    if _wants_bos(tokenizer) and (
+        ids.shape[-1] == 0 or ids[0, 0].item() != tokenizer.bos_token_id
+    ):
+        bos = torch.full((1, 1), tokenizer.bos_token_id, dtype=ids.dtype)
+        ids = torch.cat([bos, ids], dim=-1)
+
+    return ids
+
+
+def render(tokenizer, conversation, continuing=False):
+    """The chat template as text, ending where the model is to write.
+
+    With continuing=True the last message is a half-finished assistant turn
+    that generation is about to resume inside, so the text has to end in the
+    middle of that turn rather than after it. Rendering the earlier turns with
+    add_generation_prompt gives the text up to where the assistant starts
+    speaking; the partial reply is appended raw. The model then sees exactly
+    what it had already written, with no closing marker in between, and
+    carries on from there.
+    """
+
+    if continuing:
+        prefix = tokenizer.apply_chat_template(
+            conversation[:-1],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+
+        return prefix + conversation[-1]["content"]
+
+    return tokenizer.apply_chat_template(
+        conversation,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+
+
 def build_prompt_ids(tokenizer, conversation, continuing=False):
     """Render the chat template, dropping oldest turns past the token budget.
 
     The system message is always kept. Turns are dropped in user/assistant
     pairs so the alternation the template expects stays intact.
-
-    With continuing=True the last message is a half-finished assistant turn
-    that generation is about to resume inside, so the prompt has to end in the
-    middle of that turn rather than after it.
     """
 
     system = conversation[:1]
     history = list(conversation[1:])
 
     while True:
-        if continuing:
-            ids = continuation_ids(tokenizer, system + history)
-        else:
-            ids = tokenizer.apply_chat_template(
-                system + history,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors="pt",
-            )
+        ids = encode(tokenizer, render(tokenizer, system + history, continuing))
 
         if ids.shape[-1] <= MAX_PROMPT_TOKENS or len(history) <= 1:
             return ids, system + history
@@ -707,28 +870,48 @@ def build_prompt_ids(tokenizer, conversation, continuing=False):
         del history[:2]
 
 
-def continuation_ids(tokenizer, conversation):
-    """Token ids that end *inside* the final assistant turn, not after it.
+# ============================================================
+# SAMPLING
+# ============================================================
 
-    Rendering the earlier turns with add_generation_prompt gives the text up
-    to where the assistant starts speaking; the partial reply is appended
-    raw. The model then sees exactly what it had already written, with no
-    closing marker in between, and carries on from there.
+# Questions with one right answer: code, maths, definitions, conversions.
+PRECISE_PATTERN = re.compile(
+    r"```|(?<!\w)(?:c\+\+|c#)(?!\w)|\b(?:"
+    r"code|coding|functions?|class(?:es)?|methods?|scripts?|programs?|"
+    r"programming|compile|syntax|bugs?|errors?|exceptions?|traceback|debug|"
+    r"regex|sql|quer(?:y|ies)|apis?|json|yaml|xml|html|css|javascript|"
+    r"typescript|python|java|rust|golang|kotlin|swift|php|ruby|bash|shell|"
+    r"powershell|linux|docker|git|algorithms?|calculate|compute|solve|"
+    r"equations?|maths?|formulas?|convert|how many|how much|what year|"
+    r"when did|when was|define|definition|difference between|facts?"
+    r")\b",
+    re.I,
+)
+
+# Requests where there is no right answer, only better and worse ones.
+CREATIVE_PATTERN = re.compile(
+    r"\b(?:story|stories|poem|poetry|lyrics|song|haiku|limerick|jokes?|"
+    r"fiction|novel|screenplay|dialogue|role-?play|brainstorm|slogan|tagline|"
+    r"creative|imagine|invent|name ideas|ideas for)\b",
+    re.I,
+)
+
+
+def pick_sampling(message, grounded=False):
+    """Name of the SAMPLING profile for this question.
+
+    A grounded question is answered from sources it should copy faithfully,
+    so it is always precise. Otherwise code and fact win over story: "a
+    Python script that tells a joke" is code.
     """
 
-    prefix = tokenizer.apply_chat_template(
-        conversation[:-1],
-        add_generation_prompt=True,
-        tokenize=False,
-    )
+    if grounded or PRECISE_PATTERN.search(message):
+        return "precise"
 
-    text = prefix + conversation[-1]["content"]
+    if CREATIVE_PATTERN.search(message):
+        return "creative"
 
-    return tokenizer(
-        text,
-        return_tensors="pt",
-        add_special_tokens=False,
-    ).input_ids
+    return "balanced"
 
 
 # ============================================================
@@ -746,16 +929,183 @@ def eos_ids(tokenizer):
     return set(eos) if isinstance(eos, (list, tuple)) else {eos}
 
 
-def stream_once(model, generate_kwargs, streamer, chunks):
-    """Run one generate() on a worker thread while printing the stream.
+class GeneratedRepetitionPenalty(LogitsProcessor):
+    """repetition_penalty over the answer's own tokens only.
 
-    Output is buffered to STREAM_FLUSH_SECONDS rather than flushed per token.
-    A console write is synchronous and holds the GIL that the generation thread
-    is waiting for, so one flush per token turns the printing into a brake on
-    the decoding. Several tokens per flush still reads as continuous.
+    transformers' built-in penalty counts the prompt as well, so every token
+    of the system prompt, the history, the search snippets and the recalled
+    memories was marked down. That is the opposite of what grounding needs:
+    the names, figures and URLs in the CONTEXT are exactly what the answer
+    should copy, and they were the tokens being pushed away. Penalizing only
+    what the answer itself has produced keeps the guard against loops.
+    """
+
+    def __init__(self, penalty, start):
+        self.penalty = penalty
+        self.start = start
+
+    def __call__(self, input_ids, scores):
+        generated = input_ids[:, self.start:]
+
+        if self.penalty == 1.0 or generated.shape[-1] == 0:
+            return scores
+
+        picked = torch.gather(scores, 1, generated)
+        picked = torch.where(picked < 0, picked * self.penalty, picked / self.penalty)
+
+        return scores.scatter(1, generated, picked)
+
+
+class CancelOnEvent(StoppingCriteria):
+    """Stops generate() at its next token once the event is set."""
+
+    def __init__(self, event):
+        self.event = event
+
+    def __call__(self, input_ids, scores, **kwargs):
+        return torch.full(
+            (input_ids.shape[0],),
+            self.event.is_set(),
+            dtype=torch.bool,
+            device=input_ids.device,
+        )
+
+
+class StopFilter:
+    """Passes streamed text through, holding back what may become a stop string.
+
+    generate() stops on the role markers, but the tokens that spell one are
+    streamed before the match completes, so "<|user" reached the screen -- and
+    the stored answer -- ahead of the stop. The tail that could still turn
+    into a marker is held until it either does, and is dropped, or cannot,
+    and is released.
+    """
+
+    def __init__(self, stops):
+        self.stops = tuple(stops)
+        self.longest = max((len(stop) for stop in self.stops), default=0)
+        self.pending = ""
+        self.hit = False
+
+    def feed(self, text):
+        if self.hit:
+            return ""
+
+        self.pending += text
+
+        found = [
+            index for index in (self.pending.find(stop) for stop in self.stops)
+            if index != -1
+        ]
+
+        if found:
+            self.hit = True
+            out, self.pending = self.pending[:min(found)], ""
+            return out
+
+        hold = 0
+
+        for size in range(min(len(self.pending), self.longest - 1), 0, -1):
+            tail = self.pending[-size:]
+
+            if any(stop.startswith(tail) for stop in self.stops):
+                hold = size
+                break
+
+        cut = len(self.pending) - hold
+        out, self.pending = self.pending[:cut], self.pending[cut:]
+
+        return out
+
+    def flush(self):
+        out = "" if self.hit else self.pending
+        self.pending = ""
+
+        return out
+
+
+class ContextStreamer(TextIteratorStreamer):
+    """TextIteratorStreamer that never decodes a token out of context.
+
+    The Llama/Mistral decoder strips the leading space of the first token it
+    is given. TextStreamer starts its decode over after every newline, so the
+    first token of each new line lost its leading space -- and in code that
+    token is the indentation. Every indented line came out one space short:
+    test.html, produced before this fix, has its two-space steps at one,
+    three, five and seven spaces. A fresh streamer on a resumed round had the
+    same fault at the seam, where it glued two words together: "return value"
+    came out as "returnvalue", in code a different program.
+
+    This one keeps the last few tokens as context instead of starting over,
+    and a resumed round primes it with the tokens already shown.
+    """
+
+    CONTEXT_TOKENS = 4
+
+    def __init__(self, tokenizer, seed=()):
+        super().__init__(
+            tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        self.token_cache = list(seed)
+        self.print_len = len(self._decode())
+
+    def _decode(self):
+        return self.tokenizer.decode(self.token_cache, **self.decode_kwargs)
+
+    def put(self, value):
+        if len(value.shape) > 1:
+            value = value[0]
+
+        if self.skip_prompt and self.next_tokens_are_prompt:
+            self.next_tokens_are_prompt = False
+            return
+
+        self.token_cache.extend(value.tolist())
+        text = self._decode()
+
+        # A character spread over several byte tokens decodes as U+FFFD until
+        # its last byte arrives.
+        if text.endswith("�"):
+            return
+
+        if len(text) > self.print_len:
+            self.on_finalized_text(text[self.print_len:])
+
+        # Re-base on the last few tokens, so each decode stays a few tokens
+        # long however long the answer grows.
+        self.token_cache = self.token_cache[-self.CONTEXT_TOKENS:]
+        self.print_len = len(self._decode())
+
+    def end(self):
+        text = self._decode() if self.token_cache else ""
+        printable = text[self.print_len:]
+
+        self.token_cache = []
+        self.print_len = 0
+        self.next_tokens_are_prompt = True
+
+        self.on_finalized_text(printable, stream_end=True)
+
+
+def stream_once(model, generate_kwargs, streamer, emit):
+    """Run one generate() on a worker thread, handing its text to emit.
+
+    Any exception on this side -- Ctrl+C, or an API client that has gone away
+    raising from emit -- stops the worker at its next token. Before, it
+    carried on to max_new_tokens, which on a small card is minutes, and the
+    join below waited for every one of them.
     """
 
     result = {}
+    cancel = threading.Event()
+
+    generate_kwargs["stopping_criteria"] = StoppingCriteriaList(
+        [CancelOnEvent(cancel)]
+    )
 
     def run():
         try:
@@ -768,27 +1118,13 @@ def stream_once(model, generate_kwargs, streamer, chunks):
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
 
-    write = sys.stdout.write
-    pending = []
-    last_flush = time.monotonic()
-
     try:
         for chunk in streamer:
-            chunks.append(chunk)
-            pending.append(chunk)
-
-            now = time.monotonic()
-
-            if now - last_flush >= STREAM_FLUSH_SECONDS:
-                write("".join(pending))
-                sys.stdout.flush()
-                del pending[:]
-                last_flush = now
+            emit(chunk)
+    except BaseException:
+        cancel.set()
+        raise
     finally:
-        if pending:
-            write("".join(pending))
-
-        sys.stdout.flush()
         worker.join()
 
     if "error" in result:
@@ -840,7 +1176,12 @@ def reuse_cache(cache_state, input_ids):
         cache_state.clear()
         return None
 
-    if shared < cached_ids.shape[-1]:
+    # The cache holds one token fewer than the ids stored with it: the last
+    # token generated is never fed back through the model.
+    get_length = getattr(cache, "get_seq_length", None)
+    cached = int(get_length()) if get_length is not None else cached_ids.shape[-1]
+
+    if shared < cached:
         crop = getattr(cache, "crop", None)
 
         if crop is None:
@@ -848,10 +1189,15 @@ def reuse_cache(cache_state, input_ids):
             return None
 
         try:
-            crop(shared)
+            # A negative count removes that many tokens from the end -- the
+            # form both transformers 4.x and 5.x accept. The positive "crop
+            # to this length" form is deprecated and goes in 5.18.
+            crop(shared - cached)
         except Exception:
-            # An unfamiliar cache layout is not worth guessing at: a full
-            # recompute is slower but always correct.
+            # An unfamiliar cache layout, or a sliding-window layer that has
+            # already dropped the states it would have to roll back to, is
+            # not worth guessing at: a full recompute is slower but always
+            # correct.
             cache_state.clear()
             return None
 
@@ -859,7 +1205,7 @@ def reuse_cache(cache_state, input_ids):
 
 
 def generate_response(tokenizer, model, conversation, cache_state,
-                      continuing=False):
+                      continuing=False, on_text=None, sampling="balanced"):
     """Stream a reply, reusing the KV cache from the previous turn when possible.
 
     Each turn's prompt is the previous turn's prompt plus the new text, so the
@@ -874,7 +1220,19 @@ def generate_response(tokenizer, model, conversation, cache_state,
     token stream is what keeps long output whole: nothing is recomputed, and
     the model never sees a seam to restart or repeat itself at.
 
-    Returns (text, conversation, truncated).
+    on_text, when given, is called with each piece of text as it is decoded:
+    the console in the chat loop, a response stream in an API. Raising from
+    it cancels the generation. sampling is a SAMPLING profile name or a dict
+    of generate() sampling arguments.
+
+    Nothing is printed; the caller reports. Returns a dict:
+
+        text           the reply, with any role marker and what followed it
+                       removed
+        conversation   the conversation as sent, after any trimming
+        truncated      True when the answer budget ran out before the answer
+        finish_reason  "stop" or "length"
+        tokens, prompt_tokens, rounds, seconds -- for reporting
     """
 
     input_ids, conversation = build_prompt_ids(tokenizer, conversation, continuing)
@@ -884,8 +1242,27 @@ def generate_response(tokenizer, model, conversation, cache_state,
 
     stop_ids = eos_ids(tokenizer)
     prompt_len = input_ids.shape[-1]
+    params = SAMPLING[sampling] if isinstance(sampling, str) else dict(sampling)
 
+    # One processor for the whole answer. Its start stays at the original
+    # prompt length, so tokens from earlier rounds still count as the answer's
+    # own when a later round resumes.
+    processors = LogitsProcessorList(
+        [GeneratedRepetitionPenalty(REPETITION_PENALTY, prompt_len)]
+    )
+
+    stops = StopFilter(STOP_STRINGS)
     chunks = []
+
+    def emit(chunk):
+        text = stops.feed(chunk)
+
+        if text:
+            chunks.append(text)
+
+            if on_text is not None:
+                on_text(text)
+
     sequences = input_ids
     attention_mask = torch.ones_like(input_ids)
     produced = 0
@@ -901,37 +1278,48 @@ def generate_response(tokenizer, model, conversation, cache_state,
                 truncated = True
                 break
 
-            streamer = TextIteratorStreamer(
-                tokenizer,
-                skip_prompt=True,
-                skip_special_tokens=True,
-            )
+            budget = min(MAX_NEW_TOKENS, remaining)
 
-            # Sampling settings come from the generation config written at
-            # load time; only what changes per round is passed here.
+            # Anything that picks up mid-answer -- a resumed round, or the
+            # 'continue' command -- has to be decoded in context.
+            seed = (
+                input_ids[0, -ContextStreamer.CONTEXT_TOKENS:].tolist()
+                if (rounds or continuing) else ()
+            )
+            streamer = ContextStreamer(tokenizer, seed)
+
+            # Only what changes per call is passed here; the fixed settings
+            # were written to the generation config at load time.
             generate_kwargs = dict(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 streamer=streamer,
-                max_new_tokens=min(MAX_NEW_TOKENS, remaining),
+                max_new_tokens=budget,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
+                logits_processor=processors,
+                stop_strings=list(STOP_STRINGS),
+                tokenizer=tokenizer,
                 return_dict_in_generate=True,
+                **params
             )
 
             if past_key_values is not None:
                 generate_kwargs["past_key_values"] = past_key_values
 
-            output = stream_once(model, generate_kwargs, streamer, chunks)
+            output = stream_once(model, generate_kwargs, streamer, emit)
 
+            new_tokens = output.sequences.shape[-1] - input_ids.shape[-1]
             sequences = output.sequences
             produced = sequences.shape[-1] - prompt_len
             rounds += 1
 
             past_key_values = getattr(output, "past_key_values", None)
 
-            # Finished on its own.
-            if sequences[0, -1].item() in stop_ids:
+            # Finished on its own: EOS, a role marker, or any other stop that
+            # came before the cap.
+            if (sequences[0, -1].item() in stop_ids or stops.hit
+                    or new_tokens < budget):
                 break
 
             # Out of budget, or nothing to resume from.
@@ -952,22 +1340,16 @@ def generate_response(tokenizer, model, conversation, cache_state,
         cache_state.clear()
         raise
 
+    # Whatever the filter was still holding turned out not to be a marker.
+    tail = stops.flush()
+
+    if tail:
+        chunks.append(tail)
+
+        if on_text is not None:
+            on_text(tail)
+
     elapsed = time.monotonic() - started
-
-    if elapsed > 0 and produced > 0:
-        print("\n[{} tokens, {:.1f} tok/s{}]".format(
-            produced,
-            produced / elapsed,
-            ", {} rounds".format(rounds) if rounds > 1 else "",
-        ))
-    else:
-        print()
-
-    if truncated:
-        print(
-            "[stopped at the {}-token answer budget -- type 'continue' for "
-            "more, or '/tokens N' to raise it]".format(MAX_TOTAL_NEW_TOKENS)
-        )
 
     # Carry the populated cache into the next turn -- but only while it is
     # still small enough to be reusable. A cache longer than the prompt budget
@@ -982,18 +1364,104 @@ def generate_response(tokenizer, model, conversation, cache_state,
 
     text = "".join(chunks)
 
-    # A continuation is pasted straight onto the partial reply, so its leading
-    # whitespace is load-bearing: strip it and a resumed code block loses the
-    # newline and indentation that separated two statements.
-    return (text.rstrip() if continuing else text.strip()), conversation, truncated
+    return {
+        # A continuation is pasted straight onto the partial reply, so its
+        # leading whitespace is load-bearing: strip it and a resumed code
+        # block loses the newline and indentation between two statements.
+        "text": text.rstrip() if continuing else text.strip(),
+        "conversation": conversation,
+        "truncated": truncated,
+        "finish_reason": "length" if truncated else "stop",
+        "tokens": produced,
+        "prompt_tokens": prompt_len,
+        "rounds": rounds,
+        "seconds": elapsed,
+    }
+
+
+# ============================================================
+# OUTPUT
+# ============================================================
+
+ROLE_LABEL = re.compile(r"^\s*(?:<\|assistant\|>|assistant|ai|zephyr)\s*:\s*", re.I)
+FENCE = re.compile(r"^ {0,3}(?:```|~~~)")
+
+
+def clean_reply(text, finished=True):
+    """Tidy a whole reply for storage and display.
+
+    - A role label the model sometimes opens with ("Assistant:") is dropped.
+    - Runs of blank lines outside code blocks collapse to one. Inside code
+      they are left alone: two blank lines between functions are the style.
+    - A finished reply that left a code fence open has it closed, or every
+      Markdown renderer shows the rest of the page as code. A truncated one
+      is left open, so 'continue' carries on inside the block.
+    """
+
+    text = ROLE_LABEL.sub("", text, count=1)
+
+    lines = []
+    in_code = False
+    blank_run = 0
+
+    for line in text.split("\n"):
+        if FENCE.match(line):
+            in_code = not in_code
+            blank_run = 0
+        elif not in_code and not line.strip():
+            blank_run += 1
+
+            if blank_run > 1:
+                continue
+        else:
+            blank_run = 0
+
+        lines.append(line)
+
+    text = "\n".join(lines).strip()
+
+    if finished and in_code:
+        text += "\n```"
+
+    return text
 
 
 # ============================================================
 # CHAT
 # ============================================================
 
-def new_conversation():
-    return [{"role": "system", "content": SYSTEM_PROMPT}]
+class ConsoleStream:
+    """Writes streamed text to stdout, flushing at most every STREAM_FLUSH_SECONDS.
+
+    A console write is synchronous and holds the GIL that the generation thread
+    is waiting for, so one flush per token turns the printing into a brake on
+    the decoding. Several tokens per flush still reads as continuous.
+    """
+
+    def __init__(self, interval=STREAM_FLUSH_SECONDS):
+        self.interval = interval
+        self.pending = []
+        self.last_flush = time.monotonic()
+
+    def __call__(self, text):
+        self.pending.append(text)
+
+        now = time.monotonic()
+
+        if now - self.last_flush >= self.interval:
+            self.flush()
+            self.last_flush = now
+
+    def flush(self):
+        if self.pending:
+            sys.stdout.write("".join(self.pending))
+            del self.pending[:]
+
+        sys.stdout.flush()
+
+
+def new_conversation(notes=()):
+    return [{"role": "system", "content": system_prompt(notes)}]
 
 
 def print_memory_stats(store):
@@ -1019,6 +1487,43 @@ def print_memory_stats(store):
         ))
 
 
+def print_reply_stats(reply):
+
+    if reply["seconds"] > 0 and reply["tokens"] > 0:
+        print("\n[{} tokens, {:.1f} tok/s{}]".format(
+            reply["tokens"],
+            reply["tokens"] / reply["seconds"],
+            ", {} rounds".format(reply["rounds"]) if reply["rounds"] > 1 else "",
+        ))
+    else:
+        print()
+
+    if reply["truncated"]:
+        print(
+            "[stopped at the {}-token answer budget -- type 'continue' for "
+            "more, or '/tokens N' to raise it]".format(MAX_TOTAL_NEW_TOKENS)
+        )
+
+
+def print_sources(sources, answer):
+    """List the web sources behind an answer, so its [n] can be checked.
+
+    Only the ones the answer cites, when it cites any; otherwise all of them,
+    labelled as searched rather than as sources.
+    """
+
+    if not sources:
+        return
+
+    cited = {int(number) for number in re.findall(r"\[(\d+)\]", answer)}
+    shown = [source for source in sources if source["n"] in cited]
+
+    print("Sources:" if shown else "Searched:")
+
+    for source in shown or sources:
+        print("  [{}] {} -- {}".format(source["n"], source["title"], source["url"]))
+
+
 def chat():
 
     global MAX_TOTAL_NEW_TOKENS
@@ -1040,6 +1545,12 @@ def chat():
     last_truncated = False
     last_question = None
     last_memory = None
+    last_sampling = "balanced"
+    last_live = False
+
+    # A grounded turn whose answer was cut off keeps its sources until the
+    # answer is finished; this is the turn to strip once it is.
+    pending_rewrite = None
 
     print("\n" + "=" * 60)
     print("MODEL READY")
@@ -1091,6 +1602,8 @@ def chat():
             last_truncated = False
             last_question = None
             last_memory = None
+            last_live = False
+            pending_rewrite = None
 
             if DEVICE == "cuda":
                 torch.cuda.empty_cache()
@@ -1137,7 +1650,14 @@ def chat():
 
         if command in ("/good", "/bad"):
             if last_memory is None:
-                print("Nothing to rate yet -- ask something first.")
+                if last_live:
+                    print(
+                        "Answers about the present are not kept in memory -- "
+                        "they go stale -- so there is nothing to rate."
+                    )
+                else:
+                    print("Nothing to rate yet -- ask something first.")
+
                 continue
 
             rated = store.rate(1 if command == "/good" else -1, last_memory)
@@ -1232,22 +1752,42 @@ def chat():
 
             print("\nAI: ", end="", flush=True)
 
+            stream = ConsoleStream()
+
             try:
-                # Resumes inside the existing assistant turn, so the model
-                # picks up where it stopped instead of restarting the answer.
-                more, conversation, last_truncated = generate_response(
-                    tokenizer,
-                    model,
-                    conversation,
-                    cache_state,
-                    continuing=True,
+                try:
+                    # Resumes inside the existing assistant turn, so the model
+                    # picks up where it stopped instead of restarting the answer.
+                    reply = generate_response(
+                        tokenizer,
+                        model,
+                        conversation,
+                        cache_state,
+                        continuing=True,
+                        on_text=stream,
+                        sampling=last_sampling,
+                    )
+                finally:
+                    stream.flush()
+
+                conversation = reply["conversation"]
+                last_truncated = reply["truncated"]
+
+                conversation[-1]["content"] = clean_reply(
+                    partial + reply["text"], finished=not last_truncated
                 )
 
-                conversation[-1]["content"] = partial + more
+                print_reply_stats(reply)
+
+                if not last_truncated and pending_rewrite is not None:
+                    turn, bare = pending_rewrite
+                    turn["content"] = bare
+                    pending_rewrite = None
 
                 # Only the finished answer is worth remembering, so the
                 # extended reply replaces whatever the truncated one stored.
-                if MEMORY_ENABLED and not last_truncated and last_question:
+                if (MEMORY_ENABLED and not last_truncated and last_question
+                        and not last_live):
                     last_memory = store.remember(
                         last_question, conversation[-1]["content"]
                     )
@@ -1271,12 +1811,13 @@ def chat():
             continue
 
         context = None
+        sources = []
 
         if force_search or (RETRIEVAL_ENABLED
                             and retrieval.needs_live_data(user_message)):
 
             print("[searching the web...]", end="", flush=True)
-            context = retrieval.fetch_context(user_message)
+            context, sources = retrieval.fetch_context(user_message)
             print(" done." if context else " nothing found.")
 
         # Web context is evidence about the world; memory is evidence about
@@ -1286,6 +1827,8 @@ def chat():
         grounded = (
             retrieval.ground(user_message, context) if context else user_message
         )
+
+        notes = ()
 
         if MEMORY_ENABLED:
             # Only ever actually waits on the first question: the encoder is
@@ -1300,6 +1843,12 @@ def chat():
                 ))
 
             grounded = memory_store.ground(grounded, store.block(hits))
+            notes = store.profile()
+
+        # Rebuilt every turn, for the date and for notes captured since. The
+        # same text as last turn keeps the whole KV cache; a change costs one
+        # recompute of the prompt.
+        conversation[0]["content"] = system_prompt(notes)
 
         # The stored turn carries the retrieved snippets and the recalled
         # memories only while the model is reading them; it is rewritten back
@@ -1308,71 +1857,116 @@ def chat():
 
         augmented = grounded != user_message
         last_question = user_message
+        last_sampling = pick_sampling(user_message, grounded=bool(context))
+
+        # An answer about the present goes stale. Recalled later as "what you
+        # told this user", it would put last month's price into today's
+        # answer, so such exchanges are never stored.
+        last_live = (
+            force_search or bool(context) or retrieval.needs_live_data(user_message)
+        )
 
         print("\nAI: ", end="", flush=True)
 
+        stream = ConsoleStream()
+
+        # Only generation is undone on failure. Everything after it works on
+        # a turn that is already in the conversation, and popping "the user
+        # turn" there would remove the answer instead.
         try:
-            response, conversation, last_truncated = generate_response(
-                tokenizer,
-                model,
-                conversation,
-                cache_state,
-            )
-
-            conversation.append({"role": "assistant", "content": response})
-
-            # Drop the injected blocks now that they have been read. Left in
-            # history they would spend a large share of the prompt budget on
-            # every later turn re-showing text the model has already used, and
-            # push real conversation out of the window that much sooner.
-            #
-            # They stay while the answer is truncated: 'continue' re-renders
-            # this same turn, and the model has to still see its sources.
-            #
-            # The rewrite makes this turn diverge from what the KV cache holds,
-            # but the cache is no longer discarded for it: reuse_cache() crops
-            # to the divergence point, so every turn before this one is still
-            # reused on the next question.
-            if augmented and not last_truncated:
-                if conversation[-2]["role"] == "user":
-                    conversation[-2]["content"] = user_message
-
-            # Learn from the turn. A statement the user made about themselves
-            # is worth keeping however the reply turned out, so note capture is
-            # not gated on the answer finishing.
-            if MEMORY_ENABLED:
-                store.capture_notes(user_message)
-
-            # The exchange itself is only stored once it is complete: half an
-            # answer is not worth being reminded of later. Until then there is
-            # nothing to rate, and leaving the previous target in place would
-            # point '/good' and '/bad' at an unrelated older memory.
-            if MEMORY_ENABLED and response and not last_truncated:
-                last_memory = store.remember(user_message, response)
-            else:
-                last_memory = None
+            try:
+                reply = generate_response(
+                    tokenizer,
+                    model,
+                    conversation,
+                    cache_state,
+                    on_text=stream,
+                    sampling=last_sampling,
+                )
+            finally:
+                stream.flush()
 
         except KeyboardInterrupt:
             cache_state.clear()
             conversation.pop()
             last_truncated = False
+            pending_rewrite = None
             print("\n[interrupted]")
+            continue
 
         except torch.cuda.OutOfMemoryError:
             cache_state.clear()
             conversation.pop()
             last_truncated = False
+            pending_rewrite = None
             torch.cuda.empty_cache()
             print(
                 "\nOut of GPU memory. Lower MAX_PROMPT_TOKENS, or use "
                 "'/tokens N' with a smaller N, or type 'clear' to reset."
             )
+            continue
 
         except Exception as error:
             cache_state.clear()
             conversation.pop()
             last_truncated = False
+            pending_rewrite = None
             print("\nGeneration error: {}: {}".format(type(error).__name__, error))
+            continue
+
+        conversation = reply["conversation"]
+        last_truncated = reply["truncated"]
+
+        response = clean_reply(reply["text"], finished=not last_truncated)
+        conversation.append({"role": "assistant", "content": response})
+
+        print_reply_stats(reply)
+        print_sources(sources, response)
+
+        # Drop the injected blocks now that they have been read. Left in
+        # history they would spend a large share of the prompt budget on
+        # every later turn re-showing text the model has already used, and
+        # push real conversation out of the window that much sooner.
+        #
+        # They stay while the answer is truncated: 'continue' re-renders
+        # this same turn, and the model has to still see its sources. The
+        # rewrite then happens when the continued answer finishes.
+        #
+        # The rewrite makes this turn diverge from what the KV cache holds,
+        # but the cache is no longer discarded for it: reuse_cache() crops
+        # to the divergence point, so every turn before this one is still
+        # reused on the next question.
+        pending_rewrite = None
+
+        if augmented and conversation[-2]["role"] == "user":
+            if last_truncated:
+                pending_rewrite = (conversation[-2], user_message)
+            else:
+                conversation[-2]["content"] = user_message
+
+        last_memory = None
+
+        if not MEMORY_ENABLED:
+            continue
+
+        try:
+            # Learn from the turn. A statement the user made about themselves
+            # is worth keeping however the reply turned out, so note capture
+            # is not gated on the answer finishing. Each note is shown,
+            # because it sits in the system prompt from now on and a wrong one
+            # should be seen -- and forgotten -- straight away.
+            for record in store.capture_notes(user_message):
+                print("[noted: {}]".format(record["a"]))
+
+            # The exchange itself is only stored once it is complete: half an
+            # answer is not worth being reminded of later. Until then there is
+            # nothing to rate, and leaving the previous target in place would
+            # point '/good' and '/bad' at an unrelated older memory.
+            if response and not last_truncated and not last_live:
+                last_memory = store.remember(user_message, response)
+
+        except Exception as error:  # a memory failure must not end the chat
+            print("[memory: {}: {}]".format(type(error).__name__, error))
 
 
 # ============================================================

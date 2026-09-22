@@ -79,6 +79,23 @@ Measured on a 6 GB card: 3.84 GB resident, 8-9 tok/s, ~55 s to load the shards.
 
 ---
 
+## Answer quality
+
+Most of what makes a 7B answer well is how it is prompted, sampled and
+decoded, not the weights. On every turn:
+
+| | What | Why |
+|---|---|---|
+| BOS | `<s>` is put at the head of the prompt | Zephyr's template leaves it out, but every training sequence began with it; without it answers wander and end less cleanly |
+| System prompt | direct answer first, Markdown structure sized to the question, fenced code that names its language, no invented facts, today's date, what is known about you | a 7B follows short concrete rules far better than "be accurate" |
+| Sampling | chosen per question: `precise` (code, maths, facts, anything answered from search results), `creative` (stories, poems, brainstorming), `balanced` otherwise; all with `min_p` 0.05 | at 0.7 a 7B misspells API names and drifts off the figures in its sources, and much below 0.8 a story reads flat |
+| Repetition penalty | 1.05, on the answer's own tokens only | the built-in one also marks down every prompt token -- including the names and numbers in search results the answer is meant to copy |
+| Stop strings | `<\|user\|>`, `<\|system\|>`, `<\|assistant\|>` | the model sometimes writes a role marker and goes on to invent your next message; it now stops there, and the marker never reaches the screen or the history |
+| Streaming | every token decoded in context | the stock streamer restarts after each newline, and this tokenizer drops the first token's leading space -- so every indented line came out one space short, and words were glued together at every auto-continue seam |
+| Clean-up | a stray `Assistant:` label is dropped, blank-line runs outside code collapse, a code fence left open is closed | the stored and returned text renders as Markdown |
+
+---
+
 ## Commands
 
 | Command | Does |
@@ -112,9 +129,17 @@ When a later question resembles one already answered, the closest few memories
 are placed in the prompt before the question.
 
 **Statements about you are captured automatically.** "My name is Sneha", "I
-always use 4-space indentation", "I prefer tabs" -- these become notes, which
-are recalled on a weaker match than a whole exchange and survive `clear`,
-restarts and everything else.
+always use 4-space indentation", "I prefer tabs" -- these become notes, and
+survive `clear`, restarts and everything else. The most recent eight (your
+name always among them) go into the system prompt of every turn rather than
+being recalled by similarity: "I always use 4-space indentation" has to apply
+to "write a function that merges two lists", which it barely resembles.
+
+Because a note is shown to the model on every turn, capture is strict. It
+matches only at the start of a sentence, ignores code and questions, and skips
+sentences about the problem at hand ("I use this function but it throws", "I
+am a bit lost"). Each captured note is printed as `[noted: ...]`, so a wrong
+one can be dropped with `/forget` straight away.
 
 **Ratings close the loop.** `/good` makes an answer surface earlier next time.
 `/bad` excludes it from recall outright, because the point of a thumbs-down is
@@ -126,9 +151,15 @@ Asking the same question again replaces the stored answer rather than adding a
 near-duplicate, so the store holds your best answer to each question instead of
 every attempt at it.
 
-Recall is capped at 3 memories and ~1200 characters, roughly 300 tokens. It
+Answers about the present -- anything that searched the web, or looked like it
+should have -- are not stored. Recalled later as "what you told this user",
+they would put last month's price into today's answer.
+
+Recall is capped at 3 exchanges and ~1200 characters, roughly 300 tokens. It
 shares the prompt with web context, and on a 4096-token budget neither is
-allowed to crowd the other out.
+allowed to crowd the other out. Each recalled exchange carries its date, and
+its code blocks are left out: squeezed onto one line they are broken syntax,
+which a 7B then imitates.
 
 The store is plain files you can read, edit or delete:
 
@@ -140,9 +171,9 @@ The store is plain files you can read, edit or delete:
 Move it with the `ZYPHER_MEMORY_DIR` environment variable. Delete the directory
 to start over.
 
-If `sentence-transformers` is missing, memory falls back to hashed n-grams so
-the runner still works offline on first start -- but paraphrases stop matching,
-so recall is noticeably worse.
+If `sentence-transformers` is missing or fails to import, memory falls back to
+hashed n-grams so the runner still works offline on first start -- but
+paraphrases stop matching, so recall is noticeably worse.
 
 ---
 
@@ -152,15 +183,25 @@ The weights are frozen at training time, so anything the model says about the
 present is a guess from 2024. Questions containing time words (`today`,
 `latest`, `price`, `who won`, ...) or a year at or after 2024 trigger a search,
 and four dated snippets are injected with instructions to prefer them over
-memory of training data.
+memory of training data, cite them by number, and copy figures exactly. The
+sources an answer cites are listed under it, so each `[n]` can be checked.
 
-The router is string matching, not a model call: it runs before every turn, and
-a second forward pass to classify the question would cost more than the search
-it is trying to avoid. False negatives are recoverable with `/web <question>`.
+The router is pattern matching, not a model call: it runs before every turn,
+and a second forward pass to classify the question would cost more than the
+search it is trying to avoid. Time words are matched as whole words -- as
+substrings, "now" fired inside "know" and "score" inside "underscore", and most
+ordinary questions went to the web. Requests to produce or change something
+("write", "fix", "convert", ...) and messages containing code never search.
+False negatives are recoverable with `/web <question>`.
+
+Results are limited to the last month, except for a question about a named
+past year; a filtered search that finds nothing is retried without the filter.
+Duplicate pages are dropped, and snippets end on a whole sentence.
 
 With no network, the search backend takes ~17 s to fail. After two failures in
 a row lookups pause for the session so they stop appearing in front of answers
-the weights could have given immediately; `/web` re-arms them.
+the weights could have given immediately; `/web` re-arms them. A search that
+simply finds nothing is not a failure.
 
 Retrieved snippets and recalled memories are stripped out of the history once
 the answer is in. Left there, they would re-spend a large part of the prompt
@@ -177,7 +218,8 @@ the KV cache it just built, with the tokens it already produced as the input.
 That matters for code. Re-prompting with "continue" makes the model restate the
 last paragraph and often re-open a tag it had already closed; continuing the
 same token stream leaves no seam to restart at. `test.html` is a full portfolio
-page the runner produced this way, in one answer.
+page the runner produced this way, in one answer -- before the streaming fix
+under **Answer quality**, which is why its indentation runs one space short.
 
 When an answer does hit the total budget it says so, and `continue` resumes
 inside the same assistant turn.
@@ -191,14 +233,16 @@ All at the top of each file.
 | Setting | File | Default |
 |---|---|---|
 | `MODEL_PATH` | `llm.py` | `C:\AI\Models\zephyr-7b-beta-abliterated` |
-| `SYSTEM_PROMPT` | `llm.py` | instructs complete, non-abbreviated code |
+| `SYSTEM_PROMPT` | `llm.py` | accuracy and Markdown formatting rules, complete code |
 | `MAX_PROMPT_TOKENS` | `llm.py` | 8192 (4096 under 8 GB VRAM) |
 | `MAX_TOTAL_NEW_TOKENS` | `llm.py` | 8192 (4096 under 8 GB VRAM) |
-| `TEMPERATURE` / `TOP_P` | `llm.py` | 0.7 / 0.9 |
-| `REPETITION_PENALTY` | `llm.py` | 1.05 -- kept mild, higher damages code |
+| `SAMPLING` | `llm.py` | temperature 0.3 / 0.6 / 0.85 for precise / balanced / creative |
+| `REPETITION_PENALTY` | `llm.py` | 1.05 on the answer only -- kept mild, higher damages code |
+| `STOP_STRINGS` | `llm.py` | Zephyr's role markers |
 | `MEMORY_ENABLED` | `llm.py` | `True` |
 | `RETRIEVAL_ENABLED` | `llm.py` | `True` |
 | `RECALL_KEEP` / `RECALL_THRESHOLD` | `memory.py` | 3 / 0.42 |
+| `PROFILE_MAX_NOTES` | `memory.py` | 8 notes in the system prompt |
 | `EMBED_MODEL` | `memory.py` | `all-MiniLM-L6-v2` |
 | `MAX_RESULTS` / `TIME_LIMIT` | `retrieval.py` | 4 / last month |
 
@@ -234,10 +278,15 @@ generation runs twenty times slower than it should.
 
 **Answers are slow on a machine with a GPU.** `torch.cuda.is_available()` is
 almost certainly `False`, which means the CPU build of torch got installed. See
-**Install**.
+**Install**. Upgrading anything that depends on torch (`pip install -U ...`)
+can quietly replace a CUDA build with the CPU one from PyPI.
+
+**`OSError: Could not load this library: ...libtorchaudio.pyd`.** A torchaudio
+built for an older torch is still installed. transformers imports it whenever
+it is present, so loading the model fails, and memory falls back to hashed
+embeddings. This project does not use it: `pip uninstall torchaudio`, or
+reinstall it from the same index and version line as torch.
 
 **Garbled characters in web results.** The Windows console defaults to cp1252
 and cannot encode most of what comes back from a search. stdout is reconfigured
 to UTF-8 with replacement, so the odd character is lost rather than the answer.
-#   z e p y h e r L L M  
- 
