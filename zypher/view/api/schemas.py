@@ -49,6 +49,7 @@ class ChatRequest(BaseModel):
     web: Union[bool, Literal["auto"]] = "auto"
     memory: Optional[bool] = None
     sampling: Optional[Literal["precise", "balanced", "creative"]] = None
+    min_tokens: Optional[int] = Field(default=None, ge=1)
 
 
 class NoteRequest(BaseModel):

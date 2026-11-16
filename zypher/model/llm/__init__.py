@@ -1,47 +1,55 @@
 """
-The language model: download, load, prompt, generate.
+The language model, behind one small interface.
 
-    device.py      which hardware, and the budgets it can afford
-    download.py    fetch and checksum the weights
-    loader.py      tokenizer and model onto the device
-    prompt.py      system prompt and chat template
-    sampling.py    sampling profile per question
-    generation.py  streaming generation with KV-cache reuse, and reply clean-up
+    text.py      system prompt, reply clean-up, shared errors
+    sampling.py  sampling profile per question
+    llamacpp/    the default engine: a GGUF model on llama.cpp
+    hf/          the original engine: transformers + bitsandbytes
+
+An engine is created with create_engine() and has:
+
+    load()      fetch what is missing, load the model. Blocks.
+    generate(conversation, continuing=False, on_text=None, sampling=None,
+             max_total_tokens=None, min_tokens=None)
+                stream one reply. conversation is the full message list,
+                system message first. on_text is called with each piece of
+                text; raising from it cancels the generation. sampling is a
+                dict of temperature / top_p / min_p. Returns a dict:
+
+        text           the reply, role markers removed
+        conversation   the conversation as sent, after any trimming
+        truncated      True when the answer budget ran out first
+        finish_reason  "stop" or "length"
+        tokens, prompt_tokens, cached_tokens, tokens_per_second,
+        rounds, seconds -- for reporting
+        throttled      None, or {"gpu_temp_c", "usual_tokens_per_second"}
+                       when a hot GPU cost this answer its speed
+
+    reset()     drop cached prompt state
+    close()     release the model
+    asleep()    True when the model was unloaded for being idle
+    info()      backend, device, context -- for /health
+
+Nothing is imported until an engine is asked for, so the console's --help and
+the API's first response do not wait on an inference library.
 """
 
-import importlib
-import importlib.util
-import sys
+from zypher import config
 
-# transformers imports torchaudio whenever it is installed, including on the
-# way to loading a text-only model. One built for an older torch -- left behind
-# when something upgraded torch -- fails to load its DLL with an OSError, and
-# the model cannot be loaded at all. Nothing here uses audio, so a torchaudio
-# that will not import is marked absent, and transformers skips it.
-if importlib.util.find_spec("torchaudio") is not None:
-    try:
-        importlib.import_module("torchaudio")
-    except Exception as error:
-        sys.modules["torchaudio"] = None
-        print("[ignoring torchaudio, which failed to import: {}]".format(
-            type(error).__name__
-        ))
-
-import torch
-
-
-# Ampere and later can run the fp32 matmuls that survive quantization -- the
-# lm_head projection above all -- through the tensor cores at roughly three
-# times the throughput. The precision given up is far below what 4-bit weights
-# have already conceded.
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-
-# The public surface of the model layer.
-from .device import DEVICE, VRAM_GB
-from .download import download_model
-from .generation import ClientGone, clean_reply, generate_response
-from .loader import load_model, load_tokenizer, warm_up
-from .prompt import system_prompt
 from .sampling import pick_sampling
+from .text import ClientGone, OutOfMemory, PromptTooLong, clean_reply, system_prompt
+
+
+def create_engine():
+    """The engine named by ZYPHER_BACKEND."""
+
+    if config.BACKEND == "transformers":
+        from .hf import Engine
+    elif config.BACKEND in ("llamacpp", "llama.cpp", "llama-cpp", "gguf"):
+        from .llamacpp import Engine
+    else:
+        raise ValueError(
+            "ZYPHER_BACKEND is {!r}; use 'llamacpp' or 'transformers'".format(config.BACKEND)
+        )
+
+    return Engine()

@@ -1,41 +1,8 @@
-"""System prompt, chat template, and fitting a conversation into the budget."""
-
-import datetime
+"""Chat template, and fitting a conversation into the budget."""
 
 import torch
 
 from zypher import config
-from zypher.config import SYSTEM_PROMPT
-
-
-def system_prompt(notes=()):
-    """SYSTEM_PROMPT plus today's date and what is known about the user.
-
-    The date is stated on every turn, not only on the ones that searched the
-    web: without it the model reasons from its training year and gets ages,
-    durations and "how long ago" wrong.
-
-    The notes go here rather than into the user turn. A preference applies to
-    every question, including the many it does not resemble, and text at the
-    head of the prompt stays in the KV cache instead of being read again on
-    each turn. Its wording must therefore stay stable from turn to turn.
-    """
-
-    parts = [
-        SYSTEM_PROMPT,
-        "",
-        "Today's date is {}.".format(datetime.date.today().strftime("%d %B %Y")),
-    ]
-
-    if notes:
-        parts.append("")
-        parts.append(
-            "What you know about the user -- follow their stated preferences, "
-            "and use the facts only where they are relevant:"
-        )
-        parts.extend("- {}".format(note) for note in notes)
-
-    return "\n".join(parts)
 
 
 _BOS_CACHE = {}
@@ -118,17 +85,21 @@ def render(tokenizer, conversation, continuing=False):
 def build_prompt_ids(tokenizer, conversation, continuing=False):
     """Render the chat template, dropping oldest turns past the token budget.
 
-    The system message is always kept. Turns are dropped in user/assistant
-    pairs so the alternation the template expects stays intact.
+    The system message is always kept, and so is the turn being answered:
+    the question, and with continuing the partial reply after it -- a long
+    reply being continued is over the budget by itself, and dropping it with
+    its question would leave nothing to continue. Turns are dropped in
+    user/assistant pairs so the alternation the template expects stays intact.
     """
 
     system = conversation[:1]
     history = list(conversation[1:])
+    keep = 2 if continuing else 1
 
     while True:
         ids = encode(tokenizer, render(tokenizer, system + history, continuing))
 
-        if ids.shape[-1] <= config.MAX_PROMPT_TOKENS or len(history) <= 1:
+        if ids.shape[-1] <= config.MAX_PROMPT_TOKENS or len(history) <= keep:
             return ids, system + history
 
         # Drop the oldest exchange.

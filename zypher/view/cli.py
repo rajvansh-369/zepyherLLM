@@ -9,10 +9,8 @@ left behind for 'continue' and '/good'.
 import sys
 import time
 
-import torch
-
 from zypher import config
-from zypher.model import retrieval
+from zypher.model import llm, retrieval
 from zypher.presenter import Assistant
 
 HELP = """\
@@ -80,20 +78,43 @@ def print_memory_stats(assistant):
 def print_reply_stats(result):
     usage, meta = result["usage"], result["meta"]
 
-    if meta["seconds"] > 0 and usage["completion_tokens"] > 0:
-        print("\n[{} tokens, {:.1f} tok/s{}]".format(
+    if usage["completion_tokens"] > 0:
+        cached = usage["prompt_tokens_details"]["cached_tokens"]
+
+        print("\n[{} tokens, {:.1f} tok/s, prompt {} tokens{}]".format(
             usage["completion_tokens"],
-            usage["completion_tokens"] / meta["seconds"],
-            ", {} rounds".format(meta["rounds"]) if meta["rounds"] > 1 else "",
+            meta["tokens_per_second"],
+            usage["prompt_tokens"],
+            " ({} cached)".format(cached) if cached else "",
         ))
     else:
         print()
 
-    if result["finish_reason"] == "length":
+    hot = meta["throttled"]
+
+    if hot:
         print(
-            "[stopped at the {}-token answer budget -- type 'continue' for "
-            "more, or '/tokens N' to raise it]".format(config.MAX_TOTAL_NEW_TOKENS)
+            "[the GPU is at {} C and has throttled itself: this ran at {:.0f} "
+            "tok/s, against {:.0f} when cool. Give it a minute, or give the "
+            "laptop more airflow.]".format(
+                hot["gpu_temp_c"], meta["tokens_per_second"], hot["usual_tokens_per_second"]
+            )
         )
+
+    if result["finish_reason"] == "length":
+        if usage["completion_tokens"] >= config.MAX_TOTAL_NEW_TOKENS:
+            print(
+                "[stopped at the {}-token answer budget -- type 'continue' for "
+                "more, or '/tokens N' to raise it]".format(config.MAX_TOTAL_NEW_TOKENS)
+            )
+        else:
+            # Under the budget, so it was the request's own limit or the end
+            # of the context window that stopped it.
+            print(
+                "[stopped after {} tokens -- type 'continue' for more]".format(
+                    usage["completion_tokens"]
+                )
+            )
 
 
 def print_sources(meta):
@@ -134,10 +155,15 @@ class Console:
 
         config.MAX_TOTAL_NEW_TOKENS = int(argument)
         print("Answer budget is now {} tokens.".format(config.MAX_TOTAL_NEW_TOKENS))
-        print(
-            "Each context token costs ~128 KB of VRAM, so if generation "
-            "starts running out of memory, lower it again or 'clear' first."
-        )
+
+        context = self.assistant.engine_info().get("context")
+
+        if context:
+            print(
+                "Prompt and answer share a {}-token context window, so a long "
+                "conversation leaves an answer less than this. Set ZYPHER_CTX "
+                "to change the window.".format(context)
+            )
 
     def cmd_web(self, argument):
         """'/web' toggles; '/web <question>' forces a lookup for that one."""
@@ -240,6 +266,8 @@ class Console:
                 elif payload["stage"] == "recalled":
                     count = payload["count"]
                     print("[recalled {} memor{}]".format(count, "y" if count == 1 else "ies"))
+                elif payload["stage"] == "waking":
+                    print("[loading the model back in...]", flush=True)
                 return
 
             if not started[0]:
@@ -258,7 +286,7 @@ class Console:
             print("\n[interrupted]")
             return False
 
-        except torch.cuda.OutOfMemoryError:
+        except llm.OutOfMemory:
             print(
                 "\nOut of GPU memory. Lower the budget with '/tokens N', or "
                 "type 'clear' to reset the conversation."
@@ -305,6 +333,11 @@ class Console:
         print("Answer budget: {} tokens (prompt budget: {}).".format(
             config.MAX_TOTAL_NEW_TOKENS, config.MAX_PROMPT_TOKENS
         ))
+
+        if config.BACKEND != "transformers" and config.IDLE_UNLOAD_SECONDS > 0:
+            print("The model unloads after {} min idle and reloads on the next "
+                  "question.".format(config.IDLE_UNLOAD_SECONDS // 60))
+
         print_memory_stats(self.assistant)
         print("-" * 60)
         print(HELP.format(web=on_off(config.RETRIEVAL_ENABLED),
@@ -364,13 +397,16 @@ def main():
 
     try:
         assistant.load()
+        Console(assistant).run()
     except KeyboardInterrupt:
         print("\nInterrupted.")
         return 1
     except Exception as error:
         print("\nCould not start: {}: {}".format(type(error).__name__, error))
         return 1
-
-    Console(assistant).run()
+    finally:
+        # Gives the VRAM back at once rather than when the interpreter gets
+        # round to its exit handlers.
+        assistant.close()
 
     return 0

@@ -19,8 +19,6 @@ turn re-showing text the model has already used.
 
 import threading
 
-import torch
-
 from zypher import config
 from zypher.model import llm
 from zypher.model import memory as memory_store
@@ -32,20 +30,18 @@ class ModelNotReady(Exception):
 
 
 class Assistant:
-    """The loaded model and memory store, and the lock that serialises them.
+    """The engine and memory store, and the lock that serialises them.
 
-    One model on one GPU: generations run one at a time. The KV cache follows
-    whichever turn ran last, and reuse_cache() crops it to the prefix the next
-    prompt shares with it -- so a view resending its growing history reuses
-    nearly all of it, and interleaved API clients cost a recompute, never a
-    wrong answer.
+    One model on one GPU: generations run one at a time. The engine's prompt
+    cache follows whichever turn ran last and is reused up to the point where
+    the next prompt differs from it -- so a view resending its growing history
+    reuses nearly all of it, and interleaved API clients cost a recompute,
+    never a wrong answer.
     """
 
     def __init__(self):
-        self.tokenizer = None
-        self.model = None
+        self.engine = None
         self.store = None
-        self.cache_state = {}
         self.lock = threading.Lock()
         self.ready = threading.Event()
         self.error = None
@@ -58,21 +54,17 @@ class Assistant:
     # -- lifecycle --------------------------------------------
 
     def load(self):
-        """Download if needed, load and warm up. Blocks for about a minute."""
+        """Fetch what is missing and load the model. Blocks: seconds once
+        everything is on disk, a download's worth the first time."""
 
         try:
             # Constructed first: it loads its encoder on a background thread,
             # and the model load below covers that for free.
             self.store = memory_store.Memory()
 
-            if not llm.download_model():
-                raise RuntimeError("model download or verification failed")
-
-            self.tokenizer = llm.load_tokenizer()
-            self.model = llm.load_model()
-
-            if config.WARMUP:
-                llm.warm_up(self.tokenizer, self.model)
+            engine = llm.create_engine()
+            self.engine = engine
+            engine.load()
 
             self.ready.set()
 
@@ -87,18 +79,29 @@ class Assistant:
         return "ready" if self.ready.is_set() else "loading"
 
     def reset(self):
-        """Forget the KV cache and the pending sources, as 'clear' does."""
+        """Forget the cached prompt and the pending sources, as 'clear' does."""
 
-        self.cache_state.clear()
         self._last_grounded = None
 
-        if llm.DEVICE == "cuda":
-            torch.cuda.empty_cache()
+        if self.engine is not None:
+            self.engine.reset()
+
+    def close(self):
+        """Release the model. The views call this on the way out."""
+
+        if self.engine is not None:
+            self.engine.close()
+
+    def engine_info(self):
+        """Backend, device and context window, or {} before the load."""
+
+        return self.engine.info() if self.engine is not None else {}
 
     # -- the turn ---------------------------------------------
 
     def answer(self, messages, web="auto", memory=None, sampling=None,
-               temperature=None, top_p=None, max_tokens=None, on_event=None):
+               temperature=None, top_p=None, max_tokens=None, min_tokens=None,
+               on_event=None):
         """Answer a conversation. Blocking; call it off the event loop.
 
         messages: [{"role": "system"|"user"|"assistant", "content": str}].
@@ -110,14 +113,17 @@ class Assistant:
         sampling: a SAMPLING profile name, or None to pick per question.
         temperature, top_p: override the profile's values.
         max_tokens: answer budget, capped at config.MAX_TOTAL_NEW_TOKENS.
+        min_tokens: no end of turn before this many tokens, capped at the
+            answer budget.
         on_event(kind, payload): "status" with a dict before generation
-            ({"stage": "searching"} or {"stage": "recalled", "count": n}),
+            ({"stage": "searching"}, {"stage": "recalled", "count": n}, or
+            {"stage": "waking"} when the model has to be loaded back in),
             then "text" with each decoded piece. Raising from it -- ClientGone
             for a vanished reader -- cancels the generation.
 
         Returns a dict: text, finish_reason, usage, and meta -- sampling,
         live, sources, cited, recalled, notes_captured, memory_id, seconds,
-        rounds, history_kept.
+        tokens_per_second, throttled, rounds, history_kept.
         """
 
         if self.error is not None:
@@ -211,11 +217,6 @@ class Assistant:
         if top_p is not None:
             params["top_p"] = top_p
 
-        # generate() rejects a zero temperature with sampling on; zero means
-        # greedy.
-        if params["temperature"] <= 0:
-            params = {"do_sample": False}
-
         budget = min(max_tokens or config.MAX_TOTAL_NEW_TOKENS, config.MAX_TOTAL_NEW_TOKENS)
 
         # An answer about the present goes stale. Recalled later as "what you
@@ -224,20 +225,22 @@ class Assistant:
         live = bool(context) or web is True or retrieval.needs_live_data(question)
 
         with self.lock:
+            # Unloaded for being idle: this answer starts with the model
+            # being read back in, and the reader should know why it waits.
+            if self.engine.asleep():
+                event("status", {"stage": "waking"})
+
             try:
-                reply = llm.generate_response(
-                    self.tokenizer,
-                    self.model,
+                reply = self.engine.generate(
                     conversation,
-                    self.cache_state,
                     continuing=continuing,
                     on_text=lambda text: event("text", text),
                     sampling=params,
                     max_total_tokens=budget,
+                    min_tokens=min_tokens,
                 )
-            except torch.cuda.OutOfMemoryError:
-                self.cache_state.clear()
-                torch.cuda.empty_cache()
+            except llm.OutOfMemory:
+                self.engine.reset()
                 raise
 
         finished = not reply["truncated"]
@@ -282,6 +285,9 @@ class Assistant:
                 "prompt_tokens": reply["prompt_tokens"],
                 "completion_tokens": reply["tokens"],
                 "total_tokens": reply["prompt_tokens"] + reply["tokens"],
+                # How much of the prompt came out of the cache rather than
+                # being read again -- the OpenAI field for it.
+                "prompt_tokens_details": {"cached_tokens": reply["cached_tokens"]},
             },
             "meta": {
                 "sampling": profile,
@@ -292,6 +298,10 @@ class Assistant:
                 "notes_captured": captured,
                 "memory_id": memory_id,
                 "seconds": round(reply["seconds"], 3),
+                "tokens_per_second": round(reply["tokens_per_second"], 1),
+                # None, or the GPU temperature and usual speed when heat
+                # slowed this answer.
+                "throttled": reply["throttled"],
                 "rounds": reply["rounds"],
                 # Turns (excluding system) that still fit the prompt budget. A
                 # view keeping its own history can drop the rest: they will

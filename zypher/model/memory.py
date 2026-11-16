@@ -37,7 +37,9 @@ import numpy as np
 from zypher.config import (
     ANSWER_CHAR_BUDGET,
     DEDUPE_THRESHOLD,
+    EMBED_DIR,
     EMBED_MODEL,
+    EMBED_RUNTIME,
     MEMORY_DIR,
     META_FILE,
     PROFILE_CHAR_BUDGET,
@@ -51,6 +53,7 @@ from zypher.config import (
     SCORE_WEIGHT,
     VECTORS_FILE,
 )
+from zypher.model import fetch
 
 
 # ============================================================
@@ -124,7 +127,7 @@ NOTES_PER_MESSAGE = 3
 # ============================================================
 
 class _HashingEmbedder:
-    """Deterministic fallback used when sentence-transformers is unavailable.
+    """Deterministic fallback used when no trained encoder can be loaded.
 
     Hashes word and character 4-grams into a fixed vector. It is weaker than a
     trained encoder at matching paraphrases, but it needs no download and no
@@ -177,13 +180,174 @@ class _SentenceEmbedder:
         return np.asarray(vectors, dtype=np.float32)
 
 
+class _OnnxEmbedder:
+    """The sentence encoder run by onnxruntime instead of torch.
+
+    Same weights, same tokenizer, same pooling: the vectors agree with
+    sentence-transformers' to float rounding, so the two share a name and
+    with it the index on disk. What differs is the cost of having it loaded.
+    sentence-transformers imports torch and transformers to run a
+    22M-parameter model, which measured ~680 MB of RAM in this process; this
+    is a tokenizer and one inference session.
+    """
+
+    FILES = (
+        "onnx/model.onnx",
+        "tokenizer.json",
+        "1_Pooling/config.json",
+        "sentence_bert_config.json",
+    )
+
+    def __init__(self, root):
+        import onnxruntime
+        from tokenizers import Tokenizer
+
+        with open(os.path.join(root, "1_Pooling", "config.json"), encoding="utf-8") as handle:
+            pooling = json.load(handle)
+
+        if pooling.get("pooling_mode_mean_tokens"):
+            self._pool = "mean"
+        elif pooling.get("pooling_mode_cls_token"):
+            self._pool = "cls"
+        else:
+            raise ValueError("this encoder's pooling is not one the ONNX path implements")
+
+        with open(os.path.join(root, "sentence_bert_config.json"), encoding="utf-8") as handle:
+            max_length = int(json.load(handle).get("max_seq_length") or 512)
+
+        # The tokenizer file carries a fixed padding length for batch export;
+        # what the model was trained with is truncation at max_seq_length and
+        # padding to the longest text in the batch.
+        tokenizer = Tokenizer.from_file(os.path.join(root, "tokenizer.json"))
+        padding = tokenizer.padding or {}
+        tokenizer.enable_truncation(max_length=max_length)
+        tokenizer.enable_padding(
+            pad_id=padding.get("pad_id", 0),
+            pad_type_id=padding.get("pad_type_id", 0),
+            pad_token=padding.get("pad_token", "[PAD]"),
+        )
+        self._tokenizer = tokenizer
+
+        options = onnxruntime.SessionOptions()
+
+        # Six layers over one sentence: more threads than this add nothing.
+        options.intra_op_num_threads = min(4, os.cpu_count() or 1)
+        options.inter_op_num_threads = 1
+
+        # By default the pool's threads spin for a while after each run in
+        # case another follows. One follows per question, minutes apart; the
+        # spinning is only heat.
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+
+        # The arena keeps the largest batch it ever served. One long answer
+        # being indexed would hold that much for the life of the process;
+        # allocating per run costs microseconds on a model this size.
+        options.enable_cpu_mem_arena = False
+
+        self._session = onnxruntime.InferenceSession(
+            os.path.join(root, "onnx", "model.onnx"),
+            options,
+            providers=["CPUExecutionProvider"],
+        )
+        self._inputs = {node.name for node in self._session.get_inputs()}
+
+        self.name = EMBED_MODEL
+        self.dim = 0
+        self.dim = int(self.encode(["probe"]).shape[1])
+
+    def encode(self, texts):
+        texts = list(texts)
+
+        if not texts:
+            return np.zeros((0, self.dim), dtype=np.float32)
+
+        rows = []
+
+        for start in range(0, len(texts), 16):
+            batch = self._tokenizer.encode_batch(texts[start:start + 16])
+
+            ids = np.array([item.ids for item in batch], dtype=np.int64)
+            mask = np.array([item.attention_mask for item in batch], dtype=np.int64)
+
+            feed = {
+                "input_ids": ids,
+                "attention_mask": mask,
+                "token_type_ids": np.zeros_like(ids),
+            }
+
+            hidden = self._session.run(
+                None, {name: value for name, value in feed.items() if name in self._inputs}
+            )[0]
+
+            if hidden.ndim == 2:
+                # An export that pools inside the graph.
+                pooled = hidden
+            elif self._pool == "cls":
+                pooled = hidden[:, 0]
+            else:
+                weights = mask[:, :, None].astype(np.float32)
+                pooled = (hidden * weights).sum(axis=1) / np.maximum(weights.sum(axis=1), 1e-9)
+
+            rows.append(pooled)
+
+        return _normalize(np.concatenate(rows).astype(np.float32))
+
+
 def _normalize(matrix):
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     np.maximum(norms, 1e-12, out=norms)
     return matrix / norms
 
 
+def _encoder_files():
+    """Folder holding the encoder's ONNX export, fetching what is missing.
+
+    EMBED_MODEL is a Hugging Face repository, or a local folder laid out the
+    same way.
+    """
+
+    if os.path.isdir(EMBED_MODEL):
+        return EMBED_MODEL
+
+    root = os.path.join(EMBED_DIR, EMBED_MODEL.replace("/", "--"))
+
+    missing = [
+        name for name in _OnnxEmbedder.FILES
+        if not os.path.exists(os.path.join(root, *name.split("/")))
+    ]
+
+    # Small files first: a model with no ONNX export is found out on a few
+    # kilobytes, not after the weights.
+    for name in sorted(missing, key=lambda item: item.endswith(".onnx")):
+        path = os.path.join(root, *name.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        if name.endswith(".onnx"):
+            print("\n[memory: downloading the recall encoder (~90 MB, once)...]")
+
+        fetch.download_verified(fetch.hub_url(EMBED_MODEL, name), path)
+
+    return root
+
+
 def _build_embedder():
+    reason = None
+
+    if EMBED_RUNTIME in ("auto", "onnx"):
+        try:
+            return _OnnxEmbedder(_encoder_files())
+        except Exception as error:
+            # In auto this is also the ordinary road for an encoder that has
+            # no ONNX export: sentence-transformers is tried next, and the
+            # reason is only shown if that is not there either.
+            reason = "{}: {}".format(type(error).__name__, error)
+
+    if EMBED_RUNTIME == "onnx":
+        print("\n[memory: the ONNX encoder is unavailable ({}); using hashed "
+              "embeddings]".format(reason))
+
+        return _HashingEmbedder()
+
     # Not just ImportError: a torchaudio left behind by an older torch fails
     # to load its DLL with an OSError from inside the import, and that used to
     # escape to _load and skip reading the history altogether.
@@ -191,8 +355,13 @@ def _build_embedder():
         from sentence_transformers import SentenceTransformer
     except Exception as error:
         if not isinstance(error, ImportError):
-            print("\n[memory: sentence-transformers failed to import ({}: {}); "
-                  "using hashed embeddings]".format(type(error).__name__, error))
+            reason = "sentence-transformers failed to import: {}: {}".format(
+                type(error).__name__, error
+            )
+
+        if reason:
+            print("\n[memory: no encoder could be loaded ({}); using hashed "
+                  "embeddings]".format(reason))
 
         return _HashingEmbedder()
 

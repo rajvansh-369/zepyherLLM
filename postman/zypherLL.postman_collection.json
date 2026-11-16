@@ -410,7 +410,7 @@
                 "completions"
               ]
             },
-            "description": "Runner extensions: `memory: false` skips recall and learning for this call; `sampling` picks `precise` / `balanced` / `creative`; `temperature` / `top_p` override it (`temperature: 0` = greedy). `max_tokens` is capped at the server budget.",
+            "description": "Runner extensions: `memory: false` skips recall and learning for this call; `sampling` picks `precise` / `balanced` / `creative`; `temperature` / `top_p` override it (`temperature: 0` = greedy). `max_tokens` is capped at the server budget; `min_tokens` forbids ending the answer before that many tokens.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"zephyr-7b\",\n  \"memory\": false,\n  \"web\": false,\n  \"sampling\": \"creative\",\n  \"temperature\": 0.9,\n  \"max_tokens\": 400,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Brainstorm five names for a local AI assistant.\"\n    }\n  ]\n}",
@@ -428,6 +428,52 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Chat (long, detailed: min_tokens)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "`min_tokens` forbids the model from ending its turn until the answer is that many tokens long -- for when Zephyr stops too soon (`finish_reason: stop` on a short answer). Capped at `max_tokens` and the server budget (4096 on a 6 GB card). Set it higher than the model has things to say and it pads with repetition; 500-1000 suits a detailed explanation.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"zephyr-7b\",\n  \"min_tokens\": 800,\n  \"max_tokens\": 4096,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Explain Python decorators in detail, with examples.\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "console.log('completion_tokens =', body.usage.completion_tokens, 'finish_reason =', body.choices[0].finish_reason);"
                 ]
               }
             }

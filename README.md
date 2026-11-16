@@ -19,26 +19,23 @@ in Python code, in line with PEP 8.
 
 ## Requirements
 
-- Python 3.11 (3.9+ works; 3.11 enables the faster weight checksum)
-- ~14 GB of disk for the model
-- A GPU with 5 GB of VRAM or more. Less than that falls back to CPU, which
-  works but answers at a few tokens per second.
+- Windows on x64, Python 3.11 (3.9+ works). On other platforms install
+  llama.cpp yourself and point `ZYPHER_LLAMA_SERVER` at `llama-server`
+- ~6 GB of disk: the model (4.4 GB), llama.cpp with its CUDA runtime (~1.1 GB)
+  and the recall encoder (90 MB)
+- An NVIDIA GPU with 6 GB of VRAM runs the whole model on the card. With less,
+  llama.cpp keeps what fits on the GPU and runs the rest on the CPU; with no
+  GPU at all it runs on the CPU, at a few tokens per second.
 
 ## Install
 
-torch on PyPI ships the **CPU** build on Windows, which silently disables the
-only path that is fast. Install it from the CUDA index first:
-
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 ```
 
-Match the index to your driver (`cu121`, `cu124`, ...). Check it took:
-
-```bash
-python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
-```
+That is all of it. The model runs in llama.cpp's `llama-server`, which is not
+a Python package: it is downloaded on first start, with the weights. There is
+no torch in the default install and no CUDA build of anything to get right.
 
 ## Setup
 
@@ -55,9 +52,13 @@ Then open `.env` and fill in what you need:
 |---|---|---|
 | `ZYPHER_API_KEY` | Clients must send it as `Authorization: Bearer <key>`. Leave it empty to run the API with no key (only safe on localhost) | empty |
 | `ZYPHER_HOST` / `ZYPHER_PORT` | where the API listens | `127.0.0.1` / `8000` |
-| `ZYPHER_MODEL_PATH` | where the weights are downloaded to | `C:\AI\Models\zephyr-7b-beta-abliterated` |
+| `ZYPHER_MODEL_PATH` | folder the weights are downloaded to, or the path of one `.gguf` file. llama.cpp and the encoder are installed beside it | `C:\AI\Models\zephyr-7b-beta-abliterated` |
 | `ZYPHER_MEMORY_DIR` | the memory store | `.memory` |
-| `ZYPHER_EMBED_MODEL` | recall encoder | `all-MiniLM-L6-v2` |
+| `ZYPHER_EMBED_MODEL` | recall encoder | `sentence-transformers/all-MiniLM-L6-v2` |
+
+The engine settings (context window, GPU layers, KV cache precision, idle
+unload, ...) are all optional and listed in `.env.example`; left unset, each is
+worked out from the hardware. `projectDetail.md` has the full table.
 
 To make a key:
 
@@ -74,35 +75,72 @@ python main.py              # console chat
 python main.py serve        # HTTP API -- see below
 ```
 
-The first run downloads `richardyoung/zephyr-7b-beta-abliterated` (~13.5 GB) to
-`ZYPHER_MODEL_PATH`.
+The first run downloads three things, each once:
 
-The download resumes if interrupted -- rerun the same command. Every shard is
-checksummed against the hash the Hub recorded for it before the model is
-loaded, and a corrupt one is deleted so the next run refetches just that shard.
-The result is cached, so startup after the first run is instant rather than
-spending two minutes rehashing 13.5 GB.
+| What | Size | Where |
+|---|---|---|
+| the model, `zephyr-7b-beta-abliterated.i1-Q4_K_M.gguf` | 4.4 GB | `ZYPHER_MODEL_PATH` |
+| the current llama.cpp release and its CUDA runtime | ~1.1 GB | `llama.cpp` beside the models folder (`ZYPHER_LLAMA_DIR`) |
+| the recall encoder | 90 MB | `encoders` beside the model folder (`ZYPHER_EMBED_DIR`) |
+
+Downloads resume if interrupted -- rerun the same command. The model and the
+encoder are checksummed against the hash the Hub recorded for them.
+
+To run a different model, set `ZYPHER_GGUF_REPO` and `ZYPHER_GGUF_FILE` to any
+GGUF on Hugging Face. Nothing else has to change: the layer count and the chat
+template are read from the file.
 
 ---
 
 ## How it loads
 
-The plan is chosen from the card actually present, because `device_map="auto"`
-does not fail on a small GPU -- it quietly spills layers to system RAM and
-generation drops to a token or two per second while the GPU sits idle. That
-failure looks like success, so the loader refuses it and says so instead.
+The model runs in a private `llama-server` child process, on a loopback port
+nobody else is told, behind a key made up for that run. The Python process
+holds no tensors: it plans the load, sends prompts over HTTP and streams the
+answer back. If Python dies, however it dies, the server is taken down with it
+rather than left holding the GPU.
 
-| VRAM | Plan | Notes |
-|---|---|---|
-| 16 GB or more | bf16 on GPU | full precision |
-| 5 GB to 16 GB | 4-bit NF4 on GPU | ~3.8 GB resident, double-quantized |
-| under 5 GB, or no GPU | bf16 on CPU | a few tokens per second |
+Three numbers decide whether a small card is fast or unusable, and they are
+chosen from the VRAM actually free at start, not from a table:
 
-Under 8 GB the prompt and answer budgets are halved automatically (8192 to
-4096 tokens each). The KV cache costs roughly 128 KB per token on this model,
-so on a small card the cache -- not the weights -- is what runs out first.
+| Decision | Rule |
+|---|---|
+| GPU layers | all of them whenever weights + context fit; otherwise llama.cpp places what fits and the CPU runs the rest |
+| KV cache precision | full (`f16`) if that still leaves 16k of context, else `q8_0` -- half the bytes per token, indistinguishable in practice |
+| Context window | the largest of 4k ... 32k that fits after `ZYPHER_VRAM_RESERVE_GB` and whatever other programs already hold |
 
-Measured on a 6 GB card: 3.84 GB resident, 8-9 tok/s, ~55 s to load the shards.
+The prompt and answer budgets are each half the context window. Windows does
+not fail when a card fills up -- the driver spills into system RAM and
+generation slows by an order of magnitude -- so the plan stays under the line
+instead of finding it.
+
+Measured on a 6 GB RTX 3060 Laptop GPU:
+
+| | |
+|---|---|
+| Plan | 12288-token context, every layer on the GPU, `q8_0` KV cache |
+| VRAM | 5.6 GB with the desktop's share |
+| System RAM | ~0.5 GB for `llama-server`, ~0.15 GB for Python |
+| Speed | 45-55 tok/s; ~43 tok/s with 5,400 tokens of prompt |
+| Follow-up turns | only the new text is evaluated -- the server keeps the rest cached |
+| Load | 2-5 s once the file is in the OS cache; a minute or two for the first read off a hard disk |
+
+For comparison, the engine this replaced (torch + bitsandbytes, 4-bit) ran the
+same model on the same card at 8-9 tok/s with a 4096-token budget.
+
+**Idle unload.** After 15 minutes without a question the model is unloaded and
+the VRAM handed back; the next question waits a few seconds while it loads
+again. `ZYPHER_IDLE_UNLOAD_SECONDS=0` keeps it loaded.
+
+**Heat.** A laptop GPU at its thermal limit drops its clock to a fraction and
+tokens per second go with it -- here, 50 tok/s fell to 9 once the card sat at
+88 C. Software cannot cure that, but it is reported: an answer that ran at
+under half the session's best speed on a card at 84 C or more is marked as
+throttled, in the console and in the API's `zypher.throttled`.
+
+**The original engine** is still there behind `ZYPHER_BACKEND=transformers`,
+for cards with 16 GB or more that want the unquantized weights. It needs
+`requirements-transformers.txt` and the 13.5 GB safetensors download.
 
 ---
 
@@ -116,9 +154,9 @@ decoded, not the weights. On every turn:
 | BOS | `<s>` is put at the head of the prompt | Zephyr's template leaves it out, but every training sequence began with it; without it answers wander and end less cleanly |
 | System prompt | direct answer first, Markdown structure sized to the question, fenced code that names its language, no invented facts, today's date, what is known about you | a 7B follows short concrete rules far better than "be accurate" |
 | Sampling | chosen per question: `precise` (code, maths, facts, anything answered from search results), `creative` (stories, poems, brainstorming), `balanced` otherwise; all with `min_p` 0.05 | at 0.7 a 7B misspells API names and drifts off the figures in its sources, and much below 0.8 a story reads flat |
-| Repetition penalty | 1.05, on the answer's own tokens only | the built-in one also marks down every prompt token -- including the names and numbers in search results the answer is meant to copy |
+| Repetition penalty | 1.05, over the last 64 tokens | a penalty over the whole prompt marks down the names and numbers in search results the answer is meant to copy; a short window has moved past the prompt after the first few tokens of an answer |
 | Stop strings | `<\|user\|>`, `<\|system\|>`, `<\|assistant\|>` | the model sometimes writes a role marker and goes on to invent your next message; it now stops there, and the marker never reaches the screen or the history |
-| Streaming | every token decoded in context | the stock streamer restarts after each newline, and this tokenizer drops the first token's leading space -- so every indented line came out one space short, and words were glued together at every auto-continue seam |
+| Streaming | text is sent as the engine decodes it, and a continued reply keeps its leading whitespace | stripped, a resumed code block loses the newline between two statements and words are glued together at the seam |
 | Clean-up | a stray `Assistant:` label is dropped, blank-line runs outside code collapse, a code fence left open is closed | the stored and returned text renders as Markdown |
 
 ---
@@ -177,7 +215,7 @@ reply = client.chat.completions.create(
 
 | Endpoint | Does |
 |---|---|
-| `GET /health` | load state, device, whether a key is required (no auth) |
+| `GET /health` | load state, engine, GPU, context window, whether a key is required (no auth) |
 | `GET /v1/models` | the one model |
 | `GET /v1/settings` | server defaults and budgets |
 | `POST /v1/chat/completions` | answer; `stream: true` for server-sent events |
@@ -194,10 +232,16 @@ Chat requests take the usual `messages`, `max_tokens`, `temperature`,
 - `web`: `"auto"` (default, the router decides), `true` (force a lookup), `false`
 - `memory`: recall and learn on this request; defaults to the server setting
 - `sampling`: `precise`, `balanced` or `creative`, instead of the per-question pick
+- `min_tokens`: no end of turn before the answer is this many tokens long, for
+  when Zephyr stops too soon. Capped at the answer budget; set it higher than
+  the model has things to say and it pads with repetition
 
 The response carries a `zypher` object with the cited `sources`, how many
 memories were recalled, notes captured, and the `memory_id` of the stored
-exchange -- pass that to `/rate`. When streaming it arrives on the last chunk.
+exchange -- pass that to `/rate`. It also reports `tokens_per_second`, and
+`throttled` when a hot GPU cost the answer its speed. When streaming it arrives
+on the last chunk. `usage.prompt_tokens_details.cached_tokens` says how much of
+the prompt the engine already had and did not evaluate again.
 
 A client system message is appended to the runner's own system prompt, not
 swapped in for it. Ending `messages` with a partial assistant message continues
@@ -219,6 +263,8 @@ it got something wrong.
 
 **Every finished exchange is stored** in `.memory/`, embedded with a small
 sentence encoder that runs on the CPU in a few milliseconds and costs no VRAM.
+It runs under onnxruntime rather than torch -- the same vectors, in about
+160 MB of RAM instead of 800.
 When a later question resembles one already answered, the closest few memories
 are placed in the prompt before the question.
 
@@ -250,8 +296,8 @@ should have -- are not stored. Recalled later as "what you told this user",
 they would put last month's price into today's answer.
 
 Recall is capped at 3 exchanges and ~1200 characters, roughly 300 tokens. It
-shares the prompt with web context, and on a 4096-token budget neither is
-allowed to crowd the other out. Each recalled exchange carries its date, and
+shares the prompt with web context, and neither is allowed to crowd the other
+out of the prompt budget. Each recalled exchange carries its date, and
 its code blocks are left out: squeezed onto one line they are broken syntax,
 which a 7B then imitates.
 
@@ -265,9 +311,13 @@ The store is plain files you can read, edit or delete:
 Move it with the `ZYPHER_MEMORY_DIR` environment variable. Delete the directory
 to start over.
 
-If `sentence-transformers` is missing or fails to import, memory falls back to
-hashed n-grams so the runner still works offline on first start -- but
-paraphrases stop matching, so recall is noticeably worse.
+The encoder's ONNX export is downloaded on first start (~90 MB). If
+`onnxruntime` or `tokenizers` is missing, or the encoder has no ONNX export,
+`sentence-transformers` is used when it is installed; `ZYPHER_EMBED_RUNTIME`
+(`auto`, `onnx`, `torch`) forces one or the other. Both give the same vectors,
+so the index on disk is shared. With neither available, memory falls back to
+hashed n-grams so the runner still works offline -- but paraphrases stop
+matching, so recall is noticeably worse.
 
 ---
 
@@ -305,18 +355,24 @@ budget on every later turn showing the model text it has already used.
 
 ## Long output
 
-`MAX_NEW_TOKENS` caps one `generate()` call; `MAX_TOTAL_NEW_TOKENS` caps an
-answer. Hitting the first ends a call, not an answer -- generation resumes from
-the KV cache it just built, with the tokens it already produced as the input.
+An answer is one streamed completion, up to the answer budget: half the
+context window by default, `/tokens N` or `max_tokens` to change it. What the
+prompt leaves of the window is the hard limit either way.
 
-That matters for code. Re-prompting with "continue" makes the model restate the
-last paragraph and often re-open a tag it had already closed; continuing the
-same token stream leaves no seam to restart at. `test.html` is a full portfolio
-page the runner produced this way, in one answer -- before the streaming fix
-under **Answer quality**, which is why its indentation runs one space short.
+When an answer hits the budget it says so, and `continue` resumes inside the
+same assistant turn: the chat template is applied to the turns before it and
+the partial reply is appended raw, so the model carries on mid-sentence
+instead of opening a new turn. That matters for code. Re-prompting with
+"continue" makes a model restate the last paragraph and often re-open a tag it
+had already closed; continuing the same token stream leaves no seam to restart
+at. The engine still has the whole prompt cached, so resuming costs nothing.
 
-When an answer does hit the total budget it says so, and `continue` resumes
-inside the same assistant turn.
+However long the reply being continued has grown, it and its question are
+never the turns dropped to make room. Once an answer reaches the end of the
+context window itself, it says so and asks for the rest in a new message.
+
+`test.html` is a full portfolio page the runner produced in one answer, under
+the original engine.
 
 ---
 
@@ -328,15 +384,16 @@ value. Per-machine ones come from `.env` (see **Setup**).
 | Setting | Default |
 |---|---|
 | `SYSTEM_PROMPT` | direct answers, no refusals or disclaimers, Markdown formatting rules, complete code |
-| `MAX_PROMPT_TOKENS` | 8192 (4096 under 8 GB VRAM) |
-| `MAX_TOTAL_NEW_TOKENS` | 8192 (4096 under 8 GB VRAM) |
+| `MAX_PROMPT_TOKENS` | half the context window (6144 on a 6 GB card) |
+| `MAX_TOTAL_NEW_TOKENS` | half the context window (6144 on a 6 GB card) |
 | `SAMPLING` | temperature 0.3 / 0.6 / 0.85 for precise / balanced / creative |
-| `REPETITION_PENALTY` | 1.05 on the answer only -- kept mild, higher damages code |
+| `REPETITION_PENALTY` / `REPEAT_LAST_N` | 1.05 over the last 64 tokens -- kept mild, higher damages code |
 | `STOP_STRINGS` | Zephyr's role markers |
 | `MEMORY_ENABLED` / `RETRIEVAL_ENABLED` | `True` / `True` |
 | `RECALL_KEEP` / `RECALL_THRESHOLD` | 3 / 0.42 |
 | `PROFILE_MAX_NOTES` | 8 notes in the system prompt |
 | `MAX_RESULTS` / `TIME_LIMIT` | 4 / last month |
+| `THROTTLE_TEMP_C` / `SLOW_ANSWER_RATIO` | 84 / 0.5 -- when a slow answer is reported as GPU throttling |
 
 ---
 
@@ -352,12 +409,18 @@ zypher/
   config.py               every setting, and the .env loader
   model/                  MODEL -- what it knows and runs on; no user I/O
     llm/
-      device.py           GPU detection, budgets for small cards
-      download.py         resumable download, shard checksums
-      loader.py           bf16 / 4-bit / CPU load plan, warm-up
-      prompt.py           system prompt, chat template, history trimming
+      __init__.py         the Engine interface; picks the engine
+      text.py             system prompt, reply clean-up, shared errors
       sampling.py         precise / balanced / creative per question
-      generation.py       streaming, KV-cache reuse, auto-continue, clean-up
+      llamacpp/           DEFAULT ENGINE -- GGUF on llama.cpp
+        __init__.py       history trimming, streaming generation, throttle check
+        gguf.py           layers / heads / context read from the file header
+        plan.py           GPU detection; context, GPU layers, KV precision
+        runtime.py        fetches llama-server and the GGUF
+        server.py         runs llama-server as a child process
+        client.py         HTTP to it
+      hf/                 ORIGINAL ENGINE -- transformers + bitsandbytes
+    fetch.py              resumable, checksummed downloads (stdlib only)
     memory.py             semantic memory, notes, ratings
     retrieval.py          web routing, search, grounding
   presenter/
@@ -370,6 +433,8 @@ zypher/
       schemas.py          request bodies
 postman/                  collection + local environment
 requirements.txt          dependencies, with the reason for each floor
+requirements-transformers.txt   extras for the original engine
+projectDetail.md          architecture, flows, full API and settings reference
 test.html                 sample long output from the runner
 ```
 
@@ -380,31 +445,46 @@ grounding source, a different learning rule) is made in one place.
 
 ## Troubleshooting
 
-**Out of GPU memory mid-chat.** The KV cache grew past what is left. `/tokens N`
-with a smaller N, or `clear`. The allocator is already configured with
-expandable segments, which prevents the common case of failing while free
-memory is still reported.
+The engine's own output is in `.logs/llama-server.log`, rewritten at every
+start. When it fails to come up, the last lines of that file are printed.
 
-**A download that hangs near 100%.** The Xet transfer backend has been seen to
-stream every byte of a shard and then stall before moving it into place. It is
-disabled in `zypher/__init__.py` before `huggingface_hub` is imported; plain HTTPS with
-range resume is the reliable path.
+**Answers slow down as a chat goes on, then recover after a pause.** The GPU is
+thermally throttling -- the console says so under the answer, and
+`nvidia-smi --query-gpu=temperature.gpu,clocks.current.graphics --format=csv`
+shows a card in the high 80s with its clock at a few hundred MHz. Give the
+laptop airflow (raised at the back, vents clear, on mains power); a cooler
+card is the only fix.
 
-**"modules were offloaded off the GPU".** Something else is holding VRAM. Close
-it and retry -- this error exists so you find out now rather than wondering why
-generation runs twenty times slower than it should.
+**Slow from the first answer.** Look at the `Plan:` line at start, or
+`gpu_layers` in `/health`. Anything but `all` means part of the model is on
+the CPU because something else was holding VRAM when it loaded. Close it and
+restart, lower `ZYPHER_CTX`, or pick a smaller quantization with
+`ZYPHER_GGUF_FILE`.
 
-**Answers are slow on a machine with a GPU.** `torch.cuda.is_available()` is
-almost certainly `False`, which means the CPU build of torch got installed. See
-**Install**. Upgrading anything that depends on torch (`pip install -U ...`)
-can quietly replace a CUDA build with the CPU one from PyPI.
+**The first load takes minutes.** The 4.4 GB file is being read off the disk
+for the first time since a restart. On a hard disk that is a minute or two; an
+SSD, or any later start, takes seconds.
 
-**`OSError: Could not load this library: ...libtorchaudio.pyd`.** A torchaudio
-built for an older torch is still installed. transformers imports it whenever
-it is present, so loading the model fails, and memory falls back to hashed
-embeddings. This project does not use it: `pip uninstall torchaudio`, or
-reinstall it from the same index and version line as torch.
+**Out of GPU memory mid-chat.** Another program took VRAM after the model was
+planned around what was free. Close it; the engine restarts itself on the next
+question. If it keeps happening, raise `ZYPHER_VRAM_RESERVE_GB` or set a
+smaller `ZYPHER_CTX`.
+
+**"no prebuilt llama.cpp for this platform".** The automatic install covers
+Windows x64. Elsewhere, install llama.cpp yourself and set
+`ZYPHER_LLAMA_SERVER` to the `llama-server` executable.
+
+**Memory says it is using hashed embeddings.** The message names the reason.
+Usually `onnxruntime` or `tokenizers` is not installed (`pip install -r
+requirements.txt`), or the encoder could not be downloaded on first start.
 
 **Garbled characters in web results.** The Windows console defaults to cp1252
 and cannot encode most of what comes back from a search. stdout is reconfigured
 to UTF-8 with replacement, so the odd character is lost rather than the answer.
+
+**With `ZYPHER_BACKEND=transformers`:** slow answers on a machine with a GPU
+almost always mean the CPU build of torch got installed -- install torch from
+the CUDA wheel index first, as `requirements-transformers.txt` says.
+`OSError: Could not load ... libtorchaudio.pyd` means a torchaudio built for an
+older torch is still installed; this project does not use it, so
+`pip uninstall torchaudio`.

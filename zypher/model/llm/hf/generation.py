@@ -1,6 +1,5 @@
-"""Streaming generation with KV-cache reuse, and clean-up of the finished reply."""
+"""Streaming generation with KV-cache reuse."""
 
-import re
 import threading
 import time
 
@@ -24,10 +23,6 @@ from zypher.config import (
 )
 
 from .prompt import build_prompt_ids
-
-
-class ClientGone(Exception):
-    """Raised from an on_text callback to stop a generation nobody is reading."""
 
 
 def eos_ids(tokenizer):
@@ -66,6 +61,26 @@ class GeneratedRepetitionPenalty(LogitsProcessor):
         picked = torch.where(picked < 0, picked * self.penalty, picked / self.penalty)
 
         return scores.scatter(1, generated, picked)
+
+
+class MinLengthEOSBlock(LogitsProcessor):
+    """Forbids EOS until the answer has min_tokens of its own.
+
+    transformers' min_new_tokens counts per generate() call, so it would reset
+    on every auto-continue round. Counting from the original prompt length
+    covers the whole answer, however many rounds it takes.
+    """
+
+    def __init__(self, eos_ids, start, min_tokens):
+        self.eos_ids = sorted(eos_ids)
+        self.start = start
+        self.min_tokens = min_tokens
+
+    def __call__(self, input_ids, scores):
+        if input_ids.shape[-1] - self.start < self.min_tokens:
+            scores[:, self.eos_ids] = -float("inf")
+
+        return scores
 
 
 class CancelOnEvent(StoppingCriteria):
@@ -318,7 +333,7 @@ def reuse_cache(cache_state, input_ids):
 
 def generate_response(tokenizer, model, conversation, cache_state,
                       continuing=False, on_text=None, sampling="balanced",
-                      max_total_tokens=None):
+                      max_total_tokens=None, min_tokens=None):
     """Stream a reply, reusing the KV cache from the previous turn when possible.
 
     Each turn's prompt is the previous turn's prompt plus the new text, so the
@@ -337,7 +352,8 @@ def generate_response(tokenizer, model, conversation, cache_state,
     the console in the chat loop, a response stream in an API. Raising from
     it cancels the generation. sampling is a SAMPLING profile name or a dict
     of generate() sampling arguments. max_total_tokens overrides
-    MAX_TOTAL_NEW_TOKENS for this answer only.
+    MAX_TOTAL_NEW_TOKENS for this answer only. min_tokens forbids EOS until
+    the answer is that long; a model with nothing left to say will pad.
 
     Nothing is printed; the caller reports. Returns a dict:
 
@@ -365,6 +381,11 @@ def generate_response(tokenizer, model, conversation, cache_state,
     processors = LogitsProcessorList(
         [GeneratedRepetitionPenalty(REPETITION_PENALTY, prompt_len)]
     )
+
+    if min_tokens and stop_ids:
+        processors.append(
+            MinLengthEOSBlock(stop_ids, prompt_len, min(min_tokens, answer_budget))
+        )
 
     stops = StopFilter(STOP_STRINGS)
     chunks = []
@@ -492,50 +513,3 @@ def generate_response(tokenizer, model, conversation, cache_state,
         "rounds": rounds,
         "seconds": elapsed,
     }
-
-
-# ============================================================
-# OUTPUT
-# ============================================================
-
-ROLE_LABEL = re.compile(r"^\s*(?:<\|assistant\|>|assistant|ai|zephyr)\s*:\s*", re.I)
-FENCE = re.compile(r"^ {0,3}(?:```|~~~)")
-
-
-def clean_reply(text, finished=True):
-    """Tidy a whole reply for storage and display.
-
-    - A role label the model sometimes opens with ("Assistant:") is dropped.
-    - Runs of blank lines outside code blocks collapse to one. Inside code
-      they are left alone: two blank lines between functions are the style.
-    - A finished reply that left a code fence open has it closed, or every
-      Markdown renderer shows the rest of the page as code. A truncated one
-      is left open, so 'continue' carries on inside the block.
-    """
-
-    text = ROLE_LABEL.sub("", text, count=1)
-
-    lines = []
-    in_code = False
-    blank_run = 0
-
-    for line in text.split("\n"):
-        if FENCE.match(line):
-            in_code = not in_code
-            blank_run = 0
-        elif not in_code and not line.strip():
-            blank_run += 1
-
-            if blank_run > 1:
-                continue
-        else:
-            blank_run = 0
-
-        lines.append(line)
-
-    text = "\n".join(lines).strip()
-
-    if finished and in_code:
-        text += "\n```"
-
-    return text

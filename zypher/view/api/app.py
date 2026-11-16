@@ -28,7 +28,11 @@ def create_app(assistant=None, load=True):
     async def lifespan(app):
         if load:
             threading.Thread(target=assistant.load, daemon=True).start()
+
         yield
+
+        # Server shutting down: stop the engine and give the VRAM back.
+        assistant.close()
 
     app = FastAPI(title="zypherLL", version="1.0", lifespan=lifespan)
     app.state.assistant = assistant

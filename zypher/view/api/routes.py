@@ -1,7 +1,7 @@
 """
 Endpoints. Each one translates HTTP to an Assistant call and back.
 
-    GET    /health                      load state, device, budgets (no auth)
+    GET    /health                      load state, engine, device (no auth)
     GET    /v1/models                   the one model
     POST   /v1/chat/completions         answer, optionally as server-sent events
     GET    /v1/memory                   stats and the notes in the system prompt
@@ -21,13 +21,12 @@ import time
 import uuid
 from typing import Literal, Optional
 
-import torch
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from zypher import config
-from zypher.model import llm, retrieval
-from zypher.model.llm import ClientGone
+from zypher.model import retrieval
+from zypher.model.llm import ClientGone, OutOfMemory
 from zypher.presenter import ModelNotReady
 
 from .schemas import ChatRequest, NoteRequest, RateRequest, SettingsRequest
@@ -59,13 +58,17 @@ router = APIRouter(dependencies=[Depends(authorize)])
 
 @public.get("/health")
 def health(assistant=Depends(assistant_of)):
-    return {
-        "status": assistant.status(),
-        "error": None if assistant.error is None else str(assistant.error),
-        "device": llm.DEVICE,
-        "vram_gb": round(llm.VRAM_GB, 2),
-        "auth": config.API_KEY is not None,
-    }
+    # backend, device, gpu, vram_gb, context, gpu_layers, kv_cache -- filled
+    # in once the engine has looked at the hardware.
+    info = {"backend": config.BACKEND, "device": None, "vram_gb": 0.0}
+    info.update(assistant.engine_info())
+
+    return dict(
+        info,
+        status=assistant.status(),
+        error=None if assistant.error is None else str(assistant.error),
+        auth=config.API_KEY is not None,
+    )
 
 
 @router.get("/v1/models")
@@ -137,6 +140,7 @@ async def chat_completions(body: ChatRequest, assistant=Depends(assistant_of)):
         temperature=body.temperature,
         top_p=body.top_p,
         max_tokens=body.max_completion_tokens or body.max_tokens,
+        min_tokens=body.min_tokens,
     )
 
     meta = {"id": "chatcmpl-" + uuid.uuid4().hex, "created": int(time.time())}
@@ -154,7 +158,7 @@ async def chat_completions(body: ChatRequest, assistant=Depends(assistant_of)):
         raise HTTPException(400, str(error))
     except ModelNotReady as error:
         raise HTTPException(503, str(error))
-    except torch.cuda.OutOfMemoryError:
+    except OutOfMemory:
         raise HTTPException(503, OOM_MESSAGE)
 
     return {
@@ -245,7 +249,7 @@ async def stream(assistant, messages, options, meta):
 
             else:
                 message = (
-                    OOM_MESSAGE if isinstance(payload, torch.cuda.OutOfMemoryError)
+                    OOM_MESSAGE if isinstance(payload, OutOfMemory)
                     else str(payload) if isinstance(payload, (ValueError, ModelNotReady))
                     else "{}: {}".format(type(payload).__name__, payload)
                 )
