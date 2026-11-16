@@ -75,6 +75,9 @@ python main.py              # console chat
 python main.py serve        # HTTP API -- see below
 ```
 
+For a ChatGPT-style chat in the browser, run `serve` and then the app in
+`web/` -- step by step in `HOW_TO_RUN.md`.
+
 The first run downloads three things, each once:
 
 | What | Size | Where |
@@ -247,6 +250,9 @@ A client system message is appended to the runner's own system prompt, not
 swapped in for it. Ending `messages` with a partial assistant message continues
 that reply, like `continue` in the console. `max_tokens` is capped at the
 answer budget.
+
+A browser app on another origin calling the API directly needs that origin in
+`ZYPHER_CORS_ORIGINS` (comma separated); unset, no CORS headers are sent.
 
 Requests are served one at a time -- one model, one GPU. Disconnecting mid-
 stream stops the generation at the next token. Set `ZYPHER_API_KEY` to require

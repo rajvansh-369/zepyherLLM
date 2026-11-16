@@ -6,16 +6,29 @@ model loads on a background thread, and chat calls return 503 until it is
 ready.
 """
 
+import os
 import threading
 from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from zypher import config
 from zypher.presenter import Assistant
 
 from .routes import public, router
+
+# Browser apps on other origins allowed to call the API directly, comma
+# separated (e.g. http://localhost:3000). Empty -- the default -- sends no
+# CORS headers, so browsers refuse cross-origin calls; the web/ app does not
+# need this, it reaches the API through its own server's proxy. Read here,
+# after config has loaded .env into the environment.
+CORS_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.environ.get("ZYPHER_CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
 
 
 def create_app(assistant=None, load=True):
@@ -36,6 +49,17 @@ def create_app(assistant=None, load=True):
 
     app = FastAPI(title="zypherLL", version="1.0", lifespan=lifespan)
     app.state.assistant = assistant
+
+    if CORS_ORIGINS:
+        # No cookies are used -- auth is the bearer key -- so credentials
+        # stay off, and "*" is honoured as "any origin".
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=CORS_ORIGINS,
+            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type"],
+        )
+
     app.include_router(public)
     app.include_router(router)
 

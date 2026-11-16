@@ -48,6 +48,7 @@ zypherLL/
 ├── README.md                      user guide
 ├── projectDetail.md               this file
 ├── test.html                      sample long output produced by the runner
+├── web/                           browser chat app (Vite + React), API client only -- see web/README.md
 ├── postman/
 │   ├── zypherLL.postman_collection.json          every endpoint, ready to send
 │   └── zypherLL.local.postman_environment.json   baseUrl, apiKey, memoryId
@@ -678,6 +679,7 @@ Unknown `/commands` are rejected rather than sent to the model.
 | `ZYPHER_API_KEY` | empty (no auth) | Bearer key for the API |
 | `ZYPHER_HOST` | `127.0.0.1` | Bind address |
 | `ZYPHER_PORT` | `8000` | Port |
+| `ZYPHER_CORS_ORIGINS` | empty (no CORS) | Comma-separated browser origins allowed to call the API directly |
 | `ZYPHER_MODEL_PATH` | `C:\AI\Models\zephyr-7b-beta-abliterated` | Weights directory, or the path of one `.gguf` file |
 | `ZYPHER_GGUF_REPO` | `mradermacher/zephyr-7b-beta-abliterated-i1-GGUF` | Hugging Face repository the GGUF is fetched from |
 | `ZYPHER_GGUF_FILE` | `zephyr-7b-beta-abliterated.i1-Q4_K_M.gguf` | Which file in it |
