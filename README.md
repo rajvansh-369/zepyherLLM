@@ -437,6 +437,7 @@ zypher/
       app.py              FastAPI app and server
       routes.py           endpoints, SSE streaming, auth
       schemas.py          request bodies
+cli/                      `zy`, a coding agent in the terminal, over the HTTP API (cli/README.md)
 postman/                  collection + local environment
 requirements.txt          dependencies, with the reason for each floor
 requirements-transformers.txt   extras for the original engine

@@ -84,6 +84,20 @@ cd D:\GIT\zypherLL
 python main.py
 ```
 
+## Coding agent in the terminal
+
+`zy` reads, edits and runs code in whatever folder you start it in. It starts
+the API by itself if it is not running.
+
+```bash
+cd D:\GIT\zypherLL
+pip install -e cli        # once
+cd D:\path\to\a\project
+zy
+```
+
+See `cli/README.md`.
+
 ## If it doesn't work
 
 | Problem | Fix |
