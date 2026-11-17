@@ -485,6 +485,9 @@ def completer(workspace):
 
 STDIN_WAIT = 3.0
 
+# The thread reading stdin, when it was given up on and may still be blocked.
+_stdin_reader = None
+
 
 def _stdin_text(have_prompt):
     """What was piped in, if anything.
@@ -527,7 +530,10 @@ def _stdin_text(have_prompt):
             started.set()
             done.set()
 
-    threading.Thread(target=pump, daemon=True).start()
+    global _stdin_reader
+
+    _stdin_reader = threading.Thread(target=pump, daemon=True)
+    _stdin_reader.start()
 
     if not started.wait(STDIN_WAIT if have_prompt else None):
         return ""
@@ -550,6 +556,23 @@ def _utf8(stream):
 
 
 def main(argv=None):
+    code = _main(argv)
+
+    if _stdin_reader is not None and _stdin_reader.is_alive():
+        # Still blocked on a stdin that never sent anything. The interpreter
+        # cannot shut down cleanly around that read, so leave directly.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+
+        os._exit(code or 0)
+
+    return code
+
+
+def _main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     prompt = " ".join(args.prompt).strip()
 
@@ -592,6 +615,7 @@ def main(argv=None):
             return 1
 
         workspace = Workspace(folder, settings.shell)
+        workspace.backup_dir = settings.home / "backups" / time.strftime("%Y%m%d-%H%M%S")
         mode = "all" if args.yes else (args.mode or "ask")
         agent = Agent(api, workspace, ui, auto=mode, tools=not args.chat)
         agent.max_tokens = args.max_tokens
@@ -631,8 +655,17 @@ def _once(run, prompt, web):
         finished = False
 
     run.save()
+    _backups(run)
 
     return 0 if finished else 1
+
+
+def _backups(run):
+    ws = run.agent.ws
+
+    if ws.backed_up:
+        run.ui.note("  Originals of the {} changed file{} are in {}".format(
+            len(ws.backed_up), "" if len(ws.backed_up) == 1 else "s", ws.backup_dir))
 
 
 def _loop(run, prompt, web, resumed, wanted_resume):
@@ -692,6 +725,7 @@ def _loop(run, prompt, web, resumed, wanted_resume):
         ui.gap()
 
     run.save()
+    _backups(run)
 
     if agent.messages:
         ui.note("  Saved. `zy -c` carries on from here.")

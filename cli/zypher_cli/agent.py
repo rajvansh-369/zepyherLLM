@@ -15,11 +15,12 @@ free sampling -- tool calls want the most likely continuation.
 """
 
 import os
+import re
 import time
 
 from . import protocol
 from .api import ApiError, Offline
-from .tools import IGNORED_DIRS, Result, ToolError, diff_stats
+from .tools import IGNORED_DIRS, Result, ToolError, diff_stats, merge_loose
 
 MAX_STEPS = 25
 MAX_FAILURES = 4
@@ -42,6 +43,31 @@ MODES = {
 }
 
 CHAINING = (";", "&", "|", "`", "$(", "\n", ">", "<")
+
+NO_CHANGE = (
+    "Nothing changed: {} already has exactly this. If an error is still "
+    "there, this is not the fix -- read the line the error points to and "
+    "change that line."
+)
+
+# Commands that install software.
+INSTALLS = re.compile(
+    r"\b(?:pip3?|uv\s+pip|poetry|pipx|conda|npm|pnpm|yarn|bun|gem|cargo|go|choco|winget|scoop|apt(?:-get)?|brew|composer)"
+    r"(?:\s+-\S+)*\s+(?:install|i|add|get)\b",
+    re.I,
+)
+
+# The model has stopped working on the task and is showing how each tool is
+# used, one call after another ("To create a file, use the following tool call:").
+TUTORIAL = re.compile(r"\b(?:use|make|send) (?:the following|this) tool call\b", re.I)
+
+# Commands that rewrite files in place. Not run: the file tools do it safely.
+WRITES_FILES = re.compile(
+    r"\b(?:Set-Content|Add-Content|Out-File|WriteAllText|WriteAllLines|WriteAllBytes)\b"
+    r"|(?:^|[|;&]\s*)(?:sc|ac)\s"
+    r"|\bsed\s+(?:-\w*\s+)*-i|\bperl\s+-\w*i|\bpython[\d.]*\s+-c\s+.*\bopen\s*\([^)]*['\"][wa]",
+    re.I,
+)
 
 
 class Declined(Exception):
@@ -86,6 +112,7 @@ class Agent:
         self.ratio = 3.0         # characters per token, measured as we go
         self.last = None         # the last finished generation's usage and meta
         self.truncated = False   # the last answer hit the token budget
+        self.vary = False        # the model is repeating itself: sample more freely
         self.system = ""
         self.profile = ()
 
@@ -194,6 +221,20 @@ class Agent:
         if self.messages and self.messages[-1]["role"] == "user":
             self._add("assistant", "answer", text)
 
+    def _forget_failure(self):
+        """Drop a request that was given up on, before the next one.
+
+        Its wrong guesses, and the "(stopped ...)" line that ended it, are
+        the nearest thing in the conversation for the model to copy -- and it
+        does, word for word.
+        """
+
+        if not self.messages or not self.messages[-1].get("gave_up"):
+            return
+
+        start = max((i for i, m in enumerate(self.messages) if m["kind"] == "user"), default=0)
+        del self.messages[start:]
+
     def clear(self):
         self.messages = []
         self.seen = set()
@@ -263,6 +304,7 @@ class Agent:
         """Answer a request. Returns True if it ran to an answer."""
 
         self._close_turn()
+        self._forget_failure()
 
         content = self.pending + text
         self.pending = ""
@@ -293,6 +335,7 @@ class Agent:
         produced = 0
         started = time.monotonic()
         finished = False
+        changed = tried = 0
 
         while True:
             if self.compact():
@@ -323,6 +366,11 @@ class Agent:
                 finished = True
                 break
 
+            if TUTORIAL.search(prose):
+                ui.warn("Stopped: the model drifted off the task (it began demonstrating tools).")
+                self._add("assistant", "answer", "(stopped: drifted off the task)", gave_up=True)
+                break
+
             steps += 1
             rendered = call.render()
             self._add(
@@ -331,6 +379,7 @@ class Agent:
             )
 
             stop = None
+            gave_up = False
 
             try:
                 result = self._execute(call)
@@ -354,14 +403,30 @@ class Agent:
             body = result.body
             failures = failures + 1 if getattr(result, "failed", False) else 0
 
+            if call.name in ("write", "edit", "replace"):
+                tried += 1
+
+                if result.ok and result.summary not in ("no change", "not written", "failed"):
+                    changed += 1
+
             if rendered == previous:
+                # The most likely continuation led here once and will again:
+                # say so briefly, without the same long result a second
+                # time, and let the next reply be sampled more freely.
                 repeats += 1
-                body += (
-                    "\n\nYou have already made this exact call. Do something "
-                    "different, or give the final answer."
+                self.vary = True
+                body = (
+                    "{}\n\nYou already made this exact call and got this same "
+                    "result. Do NOT send it again. {}".format(
+                        body.split("\n")[0],
+                        "Read the file, or search it, and use the text that is "
+                        "really there." if getattr(result, "failed", False)
+                        else "Make a different call, or give the final answer.",
+                    )
                 )
             else:
                 repeats = 0
+                self.vary = False
 
             previous = rendered
             self._add("user", "result", protocol.result_message(call.title(), body), title=call.title())
@@ -369,16 +434,22 @@ class Agent:
             if stop is None and failures >= MAX_FAILURES:
                 ui.warn("Stopped: {} tool calls in a row failed.".format(failures))
                 stop = "(stopped after repeated failed tool calls)"
-            elif stop is None and repeats >= 2:
+                gave_up = True
+            elif stop is None and repeats >= 3:
                 ui.warn("Stopped: the model kept repeating the same call.")
                 stop = "(stopped: repeating the same call)"
+                gave_up = True
             elif stop is None and steps >= MAX_STEPS:
                 ui.warn("Stopped after {} steps. Say 'continue' to carry on.".format(steps))
                 stop = "(paused after {} steps)".format(steps)
 
             if stop is not None:
-                self._add("assistant", "answer", stop)
+                self._add("assistant", "answer", stop, gave_up=gave_up)
                 break
+
+        # A small model reports "done" whether or not its change went in.
+        if tried and not changed:
+            ui.warn("No file was changed: every change the model tried failed or was declined.")
 
         self._footer(steps, produced, time.monotonic() - started)
 
@@ -445,7 +516,7 @@ class Agent:
                     messages,
                     web=False if continuing else web,
                     memory=False if self.tools else None,
-                    sampling="precise" if self.tools else None,
+                    sampling=("balanced" if self.vary else "precise") if self.tools else None,
                     max_tokens=self.max_tokens,
                 )
 
@@ -539,6 +610,9 @@ class Agent:
         return text, parsed, interrupted, tokens
 
     def _progress(self, call):
+        if call.name == "replace":
+            return call.label() if call.complete else "Replace…"
+
         if call.name in ("write", "edit") and call.path:
             return "{}({}) · {} lines".format(
                 call.name.capitalize(), call.path, call.body.count("\n") + 1
@@ -597,12 +671,22 @@ class Agent:
     def _permit(self, kind, question, command=""):
         """Raise Declined unless this may go ahead."""
 
-        if self.auto == "all":
+        # Installing changes the machine, not the project, and a small model
+        # will happily install a package it made up the name of. Always asked,
+        # whatever the mode; never done unattended.
+        installing = kind == "run" and INSTALLS.search(command)
+
+        if self.auto == "all" and not installing:
             return
 
         always = None
 
-        if kind == "edit":
+        if installing:
+            if not self.ui.interactive:
+                self.ui.outcome("installing needs an interactive session", ok=False)
+                raise Declined("installing packages is not allowed in a non-interactive run")
+
+        elif kind == "edit":
             if self.auto == "edits":
                 return
 
@@ -698,7 +782,7 @@ class Agent:
 
         if old == new:
             ui.outcome("no change")
-            return Result("{} already has exactly this content.".format(shown), "no change")
+            return Result(NO_CHANGE.format(shown), "no change")
 
         ui.diff(old, new)
         self._outside(path, "Write")
@@ -717,7 +801,7 @@ class Agent:
 
         ui.outcome(summary)
 
-        return Result("Wrote {} ({} lines).".format(shown, count), summary)
+        return self._checked(path, old, new, Result("Wrote {} ({} lines).".format(shown, count), summary))
 
     def _do_edit(self, call):
         ws, ui = self.ws, self.ui
@@ -729,15 +813,15 @@ class Agent:
                 "there is no file {}. To create it use <write path=\"{}\">.".format(shown, shown)
             )
 
+        if not call.blocks():
+            return self._edit_loose(call)
+
         try:
             old, new = ws.plan_edit(path, call.blocks())
         except ToolError as error:
             ui.outcome(str(error).split("\n")[0][:140], ok=False)
 
-            return self._failure(
-                "{}. Nothing was changed.{}\n\nCopy the SEARCH lines exactly from "
-                "the file and send the edit again.".format(error, self._show_file(path))
-            )
+            return self._failure(self._edit_help(path, call, error))
 
         ui.diff(old, new)
         self._outside(path, "Edit")
@@ -751,11 +835,191 @@ class Agent:
         summary = "+{} -{}".format(added, removed)
         ui.outcome(summary)
 
-        return Result("Edited {} ({} added, {} removed).".format(shown, added, removed), summary)
+        return self._checked(path, old, new, Result(
+            "Edited {} ({} added, {} removed).".format(shown, added, removed), summary
+        ))
+
+    def _edit_loose(self, call):
+        """An edit sent as the new code itself, with no SEARCH/REPLACE block.
+
+        Each part is worked into its file by merge_loose. A body may also
+        carry other files as "[file NAME]" sections, the way attached files
+        are shown to the model; each is applied to its own file.
+        """
+
+        ws, ui = self.ws, self.ui
+        parts = _file_sections(call.path, call.body)
+        bodies = []
+        failed = False
+
+        for index, (raw, text) in enumerate(parts):
+            path = ws.resolve(raw)
+            shown = ws.show(path)
+
+            if index:
+                ui.call("Edit({})".format(shown))
+
+            try:
+                if path.is_file():
+                    if self._key(path) not in self.seen:
+                        raise ToolError("you have not read {} yet{}".format(shown, self._show_file(path)))
+
+                    old = ws.load(path)[0]
+                    new = merge_loose(old, text)
+                    new = new if new.endswith("\n") else new + "\n"
+                else:
+                    old, new = ws.plan_write(path, protocol._unfence(text))
+
+                if old == new:
+                    ui.outcome("no change")
+                    bodies.append(NO_CHANGE.format(shown))
+                    continue
+
+                ui.diff(old, new)
+                self._outside(path, "Edit")
+                self._permit("edit", "Apply this edit to {}?".format(shown))
+
+            except ToolError as error:
+                ui.outcome(str(error).split("\n")[0][:140], ok=False)
+                failed = True
+                bodies.append(
+                    "{}: {}. Nothing was changed in it.\n\nSend the change as a block:\n"
+                    "<edit path=\"{}\">\n<<<<<<< SEARCH\nexisting lines, copied from the "
+                    "file\n=======\nnew lines\n>>>>>>> REPLACE\n</edit>".format(shown, error, shown)
+                )
+                continue
+
+            ws.commit(path, new)
+            self.undo.append((path, old))
+            self.seen.add(self._key(path))
+
+            added, removed = diff_stats(old, new)
+            summary = "+{} -{}".format(added, removed)
+            ui.outcome(summary)
+
+            result = self._checked(path, old, new, Result(
+                "Edited {} ({} added, {} removed).".format(shown, added, removed), summary))
+            failed = failed or getattr(result, "failed", False)
+            bodies.append(result.body)
+
+        result = Result("\n\n".join(bodies), "failed" if failed else "edited", ok=not failed)
+        result.failed = failed
+
+        return result
+
+    def _edit_help(self, path, call, error):
+        """What the model is told when an edit's SEARCH did not match."""
+
+        shown = self.ws.show(path)
+        text = "{}. Nothing was changed.".format(str(error).rstrip("."))
+        blocks = call.blocks()
+
+        if " in the file. Add the lines" in str(error) and len(blocks) == 1 and "\n" not in blocks[0][0]:
+            # One line that is in the file several times: almost always a
+            # rename. Hand over the call that does it.
+            return (
+                "{}\n\nTo change every one of them, send exactly this:\n{}".format(
+                    text, protocol.replace_call(shown, blocks[0][0].strip(), blocks[0][1].strip()))
+            )
+
+        if self._key(path) not in self.seen:
+            # It never looked: the SEARCH text was made up.
+            return (
+                "{} You have not read {}, so the SEARCH text was a guess.{}\n\n"
+                "Use text that is really in the file. To change a word or name "
+                'everywhere, use <replace path="{}" old="TEXT" new="TEXT"/>.'.format(
+                    text, shown, self._show_file(path), shown)
+            )
+
+        close = "\n".join(self.ws.near(path, search) for search, _ in blocks).strip()
+
+        if close:
+            return (
+                "{}\n\nThe closest lines in {} are:\n{}\n\nCopy the SEARCH lines "
+                "exactly from these and send the edit again.".format(text, shown, close)
+            )
+
+        return (
+            "{} No line in {} looks like it.\n\nFind the real text first with "
+            '<search pattern="TEXT" path="{}"/> or <read path="{}"/>.'.format(
+                text, shown, shown, shown)
+        )
+
+    def _do_replace(self, call):
+        ws, ui = self.ws, self.ui
+        path = ws.resolve(call.path)
+        shown = ws.show(path)
+        find, put = call.args["old"], call.args["new"]
+
+        try:
+            old, new, places = ws.plan_replace(path, find, put)
+        except ToolError as error:
+            ui.outcome(str(error).split("\n")[0][:140], ok=False)
+            unread = ""
+
+            if self._key(path) not in self.seen:
+                unread = " You have not read the file.{}".format(self._show_file(path))
+
+            return self._failure(
+                "{}. Nothing was changed.{}\n\nUse text that is really in the "
+                "file.".format(error, unread)
+            )
+
+        ui.diff(old, new)
+        self._outside(path, "Change")
+        self._permit("edit", "Replace {!r} with {!r} in {} place{} in {}?".format(
+            find, put, places, "" if places == 1 else "s", shown))
+
+        ws.commit(path, new)
+        self.undo.append((path, old))
+        self.seen.add(self._key(path))
+
+        summary = "{} place{}".format(places, "" if places == 1 else "s")
+        ui.outcome(summary)
+
+        return self._checked(path, old, new, Result(
+            "Replaced {!r} with {!r} in {} of {}.".format(find, put, summary, shown), summary
+        ))
+
+    def _checked(self, path, old, new, result):
+        """result, with a syntax error the change brought in added to it.
+
+        An error the file already had before the change is not reported: it
+        is not the model's to fix, and would send it off course.
+        """
+
+        problem = self.ws.check(path, new)
+
+        if not problem or (old is not None and self.ws.check(path, old)):
+            return result
+
+        self.ui.outcome("problem: {}".format(problem.split("\n")[0])[:140], ok=False)
+
+        broken = Result(
+            "{}\n\nBut {} now has an error: {}\nFix it before anything else: read "
+            "the lines around it, then edit them.".format(result.body, self.ws.show(path), problem),
+            "error in the result", ok=False,
+        )
+        broken.failed = True
+
+        return broken
 
     def _do_run(self, call):
         ws, ui = self.ws, self.ui
         command = call.body
+
+        if WRITES_FILES.search(command):
+            # Windows PowerShell reads and writes files in the ANSI code
+            # page: a -replace piped into Set-Content mangles every character
+            # outside it. The file tools keep encoding and line ends intact.
+            ui.outcome("refused: changes files from the shell", ok=False)
+
+            return self._failure(
+                "That command was not run: it changes files from the shell, which "
+                "can corrupt their text. Change files only with the tools:\n"
+                '<replace path="FILE" old="TEXT" new="TEXT"/> for text in many places, '
+                "<edit> for a few lines, <write> for a whole new file."
+            )
 
         self._permit("run", "Run this command?", command)
 
@@ -803,32 +1067,63 @@ class Agent:
         return shown
 
     def attach(self, text):
-        """Text with the content of each @file it mentions added below it.
+        """Text with the files it mentions added below it.
+
+        A file is attached when it is named with @ (@src/app.py), or named
+        plainly (src/app.py, index.html) and exists in the project. The model
+        then starts from what is really in the file instead of from a guess.
+        A big file comes as its map and its first part. Files beyond the
+        first stop once they would take more than about a tool result's
+        worth of room; the model is told to read those.
 
         Returns (text, [names attached]).
         """
 
         names = []
         extra = []
+        skipped = []
+        used = 0
+        done = set()
 
         for word in text.split():
-            if not word.startswith("@") or len(word) < 2:
+            explicit = word.startswith("@")
+            raw = word.lstrip("@").strip("\"'`()[]{}<>").rstrip(",.;:!?")
+
+            if not raw or "://" in raw or not (explicit or "." in raw or "/" in raw or "\\" in raw):
                 continue
 
             try:
-                path = self.ws.resolve(word[1:].rstrip(",.;:!?"))
-
-                if not path.is_file():
-                    continue
-
-                result = self.ws.read(path)
+                path = self.ws.resolve(raw)
             except ToolError:
                 continue
 
+            key = self._key(path)
+
+            if key in done or not path.is_file() or not (explicit or self.ws.inside(path)):
+                continue
+
+            done.add(key)
             shown = self.ws.show(path)
-            self.seen.add(self._key(path))
+
+            try:
+                result = self.ws.summary(path) or self.ws.read(path)
+            except ToolError:
+                continue
+
+            if names and used + len(result.body) > self.ws.result_chars * 1.2:
+                skipped.append(shown)
+                continue
+
+            used += len(result.body)
+
+            if result.summary != "map":   # a map is not the file: still unread
+                self.seen.add(key)
+
             names.append(shown)
             extra.append("[file {}]\n{}".format(shown, result.body))
+
+        if skipped:
+            extra.append("[not attached, to save room -- read when needed: {}]".format(", ".join(skipped)))
 
         if extra:
             text += "\n\n" + "\n\n".join(extra)
@@ -844,6 +1139,33 @@ class Agent:
         self.messages = list(data.get("messages") or [])
         self.seen = set(data.get("seen") or [])
         self._close_turn()
+
+
+_SECTION = re.compile(r"^\[file ([^\]\n]+)\][ \t]*$", re.M)
+
+
+def _file_sections(path, body):
+    """[(path, text)]: the body for path, then each "[file NAME]" section."""
+
+    marks = list(_SECTION.finditer(body))
+
+    if not marks:
+        return [(path, body)]
+
+    parts = []
+    head = body[:marks[0].start()]
+
+    if head.strip():
+        parts.append((path, head))
+
+    for index, mark in enumerate(marks):
+        end = marks[index + 1].start() if index + 1 < len(marks) else len(body)
+        text = body[mark.end():end].strip("\n")
+
+        if text.strip():
+            parts.append((mark.group(1).strip(), text))
+
+    return parts
 
 
 class _Interrupted(KeyboardInterrupt):

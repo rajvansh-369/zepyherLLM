@@ -9,11 +9,14 @@ diff and approved before anything touches the disk.
 import codecs
 import difflib
 import fnmatch
+import html as html_lib
+import json
 import os
 import queue
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -29,6 +32,124 @@ MAX_LIST_ENTRIES = 120
 MAX_MATCHES = 40
 MAX_LINE_CHARS = 240
 SEARCH_SECONDS = 8.0
+
+
+OUTLINE_PATTERNS = {
+    "python": re.compile(r"^\s*(?:async\s+def|def|class)\s+\w+"),
+    "js": re.compile(
+        r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?"
+        r"(?:function\b|class\s+\w|interface\s+\w|type\s+\w+\s*=|enum\s+\w"
+        r"|(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>"
+        r"|(?:const|let|var)\s+\w+\s*=\s*(?:async\s+)?function\b"
+        r"|(?:async\s+)?\w+\s*\([^)]*\)\s*\{\s*$)"
+    ),
+    "css": re.compile(r"^[^\s{}/*][^{}]*\{"),
+    "markdown": re.compile(r"^#{1,6}\s"),
+    "php": re.compile(r"^\s*(?:(?:public|private|protected|static|abstract|final)\s+)*(?:function|class|interface|trait)\s+\w+"),
+}
+
+OUTLINE_KINDS = {
+    ".py": "python",
+    ".js": "js", ".mjs": "js", ".cjs": "js", ".jsx": "js", ".ts": "js", ".tsx": "js",
+    ".css": "css", ".scss": "css", ".less": "css",
+    ".md": "markdown", ".markdown": "markdown",
+    ".php": "php",
+    ".html": "html", ".htm": "html", ".vue": "html", ".svelte": "html",
+}
+
+_TAG = re.compile(r"<[^>]*>")
+_INLINE_HIDDEN = re.compile(r"<!--.*?-->|<(script|style)\b.*?</\1>", re.I)
+_HIDDEN_OPEN = re.compile(r"<!--|<(script|style)\b", re.I)
+_LANDMARK = re.compile(r"<(h[1-6]|section|header|footer|nav|main|form|title)\b[^>]*>", re.I)
+_ID = re.compile(r"""\bid\s*=\s*["']([^"']+)""", re.I)
+
+
+def _page_line(row):
+    """What a line of a page shows: its text, or the landmark it opens."""
+
+    text = " ".join(html_lib.unescape(_TAG.sub(" ", row)).split())
+
+    if sum(char.isalpha() for char in text) >= 3:
+        return text
+
+    landmark = _LANDMARK.search(row)
+
+    if landmark:
+        found = _ID.search(row)
+        return "<{}{}>".format(landmark.group(1).lower(), " id=" + found.group(1) if found else "")
+
+    return ""
+
+
+_DEFINITION = {
+    ".py": re.compile(r"^([ \t]*)(?:async[ \t]+)?(?:def|class)[ \t]+(\w+)", re.M),
+    ".js": re.compile(r"^([ \t]*)(?:export[ \t]+)?(?:async[ \t]+)?function[ \t]+(\w+)", re.M),
+}
+_DEFINITION[".mjs"] = _DEFINITION[".cjs"] = _DEFINITION[".ts"] = _DEFINITION[".js"]
+
+
+def _defined_twice(text, suffix):
+    """A name defined twice at the same level -- the later one silently
+    wins, which is how an edit that added a new version next to the old one
+    shows -- or ""."""
+
+    pattern = _DEFINITION.get(suffix)
+
+    if pattern is None:
+        return ""
+
+    seen = {}
+    scope = 0   # counts top-level definitions, so methods of two classes differ
+
+    for found in pattern.finditer(text):
+        indent, name = found.group(1), found.group(2)
+
+        if not indent:
+            scope += 1
+
+        key = (indent, name, scope if indent else 0)
+        line = text.count("\n", 0, found.start()) + 1
+
+        if key in seen:
+            return "{} is defined twice, at lines {} and {}; only the later one is used. " \
+                   "Remove the one that is not wanted.".format(name, seen[key], line)
+
+        seen[key] = line
+
+    return ""
+
+
+def _node_check(suffix, text):
+    handle, name = tempfile.mkstemp(suffix=suffix)
+
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as file:
+            file.write(text)
+
+        done = subprocess.run(
+            ["node", "--check", name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+
+    if done.returncode == 0:
+        return ""
+
+    # "<file>:12\n<code>\n   ^\n\nSyntaxError: ..." -> "line 12: SyntaxError: ..."
+    output = done.stdout.decode("utf-8", "replace").replace(name, "").replace("\r", "")
+    line = re.search(r"^:(\d+)", output, re.M)
+    error = re.search(r"^\w*Error:.*$", output, re.M)
+
+    return "{}{}".format(
+        "line {}: ".format(line.group(1)) if line else "",
+        error.group(0) if error else output.strip().split("\n")[-1],
+    )
 
 
 class ToolError(Exception):
@@ -127,7 +248,13 @@ class Shell:
             for part in reversed(parts[:-1]):
                 line = "{}; if ($?) {{ {} }}".format(part, line)
 
-        script = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; " + line
+        # UTF-8 out, and UTF-8 in for Get-Content and Select-String, which
+        # Windows PowerShell otherwise read in the ANSI code page.
+        script = (
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+            "$PSDefaultParameterValues['Get-Content:Encoding'] = 'UTF8'; "
+            "$PSDefaultParameterValues['Select-String:Encoding'] = 'UTF8'; " + line
+        )
 
         return [self.program, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]
 
@@ -225,6 +352,185 @@ def apply_edit(text, search, replace):
     raise ToolError("the SEARCH text is not in the file")
 
 
+def _anchor(line):
+    """A line distinctive enough to place a change by: not blank, not just
+    brackets or a bare keyword."""
+
+    stripped = line.strip()
+
+    return len(stripped) > 3 and any(char.isalnum() for char in stripped) and stripped not in (
+        "else:", "try:", "pass", "return", "break", "continue", "</div>", "<div>", "end",
+    )
+
+
+def merge_loose(old, body):
+    """old with body worked into it, for an edit sent without SEARCH/REPLACE.
+
+    A small model asked for a change often sends the new version of the
+    part it changed -- the whole file, or one function with a few lines
+    around it -- instead of a SEARCH/REPLACE block. body is lined up against
+    old: what it leaves out at the start and end is the rest of the file and
+    stays as it is; inside, its version wins.
+    """
+
+    before = old.split("\n")
+    after = _unfence(body).split("\n")
+
+    if not any(_anchor(line) for line in after):
+        raise ToolError("the edit has no code in it")
+
+    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    anchored = [
+        b for b in matcher.get_matching_blocks()
+        if b.size and any(_anchor(line) for line in before[b.a:b.a + b.size])
+    ]
+
+    if not anchored:
+        # One definition sent alone with its header changed: no line is in
+        # the file as it is, but the header is close to one that is.
+        return _replace_block(before, after)
+
+    first, last = anchored[0], anchored[-1]
+    old_span = last.a + last.size - first.a
+    new_span = last.b + last.size - first.b
+
+    # Lines that happen to match far apart would make the body stand in for
+    # a stretch of the file it never showed, and delete it.
+    if old_span > 2 * new_span + 10:
+        raise ToolError(
+            "it is not clear where in the file this goes: its lines match places "
+            "{} lines apart".format(old_span)
+        )
+
+    # Before the first and after the last line it shares with the file, the
+    # body either rewrites the lines next to it (a changed function header,
+    # an edited last method) or adds new ones. Whichever reads closer.
+    head_new = after[:first.b]
+    head_old = before[:first.a]
+    keep_head = len(head_old) - _closest(head_old[::-1], head_new[::-1])
+
+    tail_new = after[last.b + last.size:]
+    tail_old = before[last.a + last.size:]
+    keep_tail = _closest(tail_old, tail_new)
+
+    return "\n".join(
+        before[:keep_head] + after + before[last.a + last.size + keep_tail:]
+    )
+
+
+_DEFINES = re.compile(
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?"
+    r"(?:def|class|function|interface|(?:const|let|var))\s+(\w+)"
+)
+
+
+def _defined(lines):
+    """The name the first non-blank line defines, or None."""
+
+    for line in lines:
+        if line.strip():
+            found = _DEFINES.match(line)
+            return found.group(1) if found else None
+
+    return None
+
+
+def _closest(old, new):
+    """How many lines from the start of old the lines new are a version of:
+    0 when new reads as something added rather than something changed.
+
+    Only a whole block can be replaced: the cut falls at a blank line or at
+    the end, never part way through the next function.
+    """
+
+    if not old or not [line for line in new if line.strip()]:
+        return 0
+
+    mine, theirs = _defined(new), _defined(old)
+
+    if mine and theirs and mine != theirs:
+        return 0   # a new definition next to an old one
+
+    text = "\n".join(new)
+    best, best_ratio = 0, 0.0
+    limit = len(new) * 2 + 6
+    named = {found.group(1) for found in map(_DEFINES.match, new) if found}
+
+    for count in range(1, min(len(old), limit) + 1):
+        if count < len(old) and old[count].strip():
+            continue
+
+        # Never swallow a definition the new text does not have a version of.
+        if any(found and found.group(1) not in named for found in map(_DEFINES.match, old[:count])):
+            break
+
+        ratio = difflib.SequenceMatcher(None, "\n".join(old[:count]), text, autojunk=False).ratio()
+
+        if ratio > best_ratio:
+            best, best_ratio = count, ratio
+
+    return best if best_ratio >= 0.5 else 0
+
+
+def _indent_of(line):
+    return len(line) - len(line.lstrip())
+
+
+def _replace_block(before, after):
+    """after put in place of the block in before whose first line is closest
+    to after's first line."""
+
+    while after and not after[-1].strip():
+        after = after[:-1]
+
+    header = next((line for line in after if line.strip()), "")
+    scores = sorted(
+        ((difflib.SequenceMatcher(None, line.strip(), header.strip()).ratio(), index)
+         for index, line in enumerate(before) if _anchor(line)),
+        reverse=True,
+    )
+
+    if not scores or scores[0][0] < 0.7 or (len(scores) > 1 and scores[1][0] > scores[0][0] - 0.05):
+        raise ToolError(
+            "it is not clear where in the file this goes: none of its lines are in the file"
+        )
+
+    if _defined([header]) != _defined([before[scores[0][1]]]):
+        raise ToolError(
+            "it is not clear where in the file this goes: none of its lines are in the file"
+        )
+
+    start = scores[0][1]
+    level = _indent_of(before[start])
+    end = start + 1
+
+    # The block: everything indented deeper, then a closing line at the
+    # header's own level (a "}" or an end tag).
+    while end < len(before) and (not before[end].strip() or _indent_of(before[end]) > level):
+        end += 1
+
+    if end < len(before) and _indent_of(before[end]) == level \
+            and before[end].strip().startswith(("}", ")", "]", "</")):
+        end += 1
+
+    while end > start + 1 and not before[end - 1].strip():
+        end -= 1
+
+    return "\n".join(before[:start] + after + before[end:])
+
+
+def _unfence(body):
+    lines = body.strip("\n").split("\n")
+
+    if lines and re.match(r"^\s*(?:```|~~~)[\w+-]*\s*$", lines[0]):
+        lines = lines[1:]
+
+    if lines and lines[-1].strip() in ("```", "~~~"):
+        lines = lines[:-1]
+
+    return "\n".join(lines)
+
+
 def diff_stats(old, new):
     """(added, removed) line counts."""
 
@@ -250,6 +556,8 @@ class Workspace:
         self.root = Path(os.path.abspath(root))
         self.shell = Shell(shell_choice)
         self.result_chars = result_chars
+        self.backup_dir = None      # where originals go before a change; None: nowhere
+        self.backed_up = set()
 
     # -- paths ------------------------------------------------
 
@@ -353,6 +661,17 @@ class Workspace:
             if first > total:
                 raise ToolError("{} has only {} lines".format(shown, total))
 
+        budget = self.result_chars
+        outline = ""
+
+        # A whole file that will not fit: a map of it first, so the next
+        # read can go straight to the part that matters.
+        if not match and len(text) > budget:
+            # A page's map is its text, which is most of what gets changed.
+            share = 2 if OUTLINE_KINDS.get(path.suffix.lower()) == "html" else 3
+            outline = self.outline(path, rows, budget // share)
+            budget -= len(outline)
+
         picked = []
         used = 0
 
@@ -362,7 +681,7 @@ class Workspace:
 
             used += len(row) + 1
 
-            if used > self.result_chars and picked:
+            if used > budget and picked:
                 break
 
             picked.append(row)
@@ -380,7 +699,102 @@ class Workspace:
                 shown, end + 1, min(total, end + (end - first + 1))
             )
 
-        return Result(body, "lines {}-{} of {}".format(first, end, total))
+        if outline:
+            body = (
+                "[map of {}, {} lines: line number and what is there. Read the "
+                "part you need with <read path=\"{}\" lines=\"FROM-TO\"/>]\n{}\n\n{}".format(
+                    shown, total, shown, outline, body)
+            )
+
+        return Result(body, "lines {}-{} of {}{}".format(
+            first, end, total, " + map" if outline else ""))
+
+    # -- outline ----------------------------------------------
+
+    def outline(self, path, rows, limit):
+        """Numbered lines that show how a file is laid out: definitions in
+        code, headings in Markdown, visible text in a page. "" if unknown."""
+
+        kind = OUTLINE_KINDS.get(path.suffix.lower())
+
+        if kind is None:
+            return ""
+
+        picked = []
+        used = 0
+        hidden = None    # the end marker of a <script>, <style> or comment we are in
+
+        for number, row in enumerate(rows, 1):
+            if kind == "html":
+                lowered = row.lower()
+
+                if hidden:
+                    if hidden in lowered:
+                        hidden = None
+
+                    continue
+
+                row = _INLINE_HIDDEN.sub(" ", row)
+                lowered = row.lower()
+                opened = _HIDDEN_OPEN.search(lowered)
+
+                if opened:
+                    hidden = "-->" if opened.group(0) == "<!--" else "</" + opened.group(1) + ">"
+                    row = row[:opened.start()]
+
+                entry = _page_line(row)
+            else:
+                entry = row.strip() if OUTLINE_PATTERNS[kind].match(row) else ""
+
+            if not entry:
+                continue
+
+            line = "{}: {}".format(number, entry[:110])
+            used += len(line) + 1
+
+            if used > limit:
+                picked.append("[... map cut short ...]")
+                break
+
+            picked.append(line)
+
+        return "\n".join(picked)
+
+    # -- checks -----------------------------------------------
+
+    def check(self, path, text):
+        """A syntax error in text as the file at path, or "". Only for kinds
+        of file that can be checked quickly without running anything."""
+
+        suffix = path.suffix.lower()
+        twice = _defined_twice(text, suffix)
+
+        if twice:
+            return twice
+
+        if suffix == ".py":
+            try:
+                compile(text, str(path), "exec", dont_inherit=True)
+            except SyntaxError as error:
+                rows = text.split("\n")
+                number = error.lineno or 0
+                shown = rows[number - 1].strip()[:160] if 0 < number <= len(rows) else ""
+
+                return "line {}: {}{}".format(
+                    number, error.msg, "\n    {}: {}".format(number, shown) if shown else "")
+            except ValueError as error:
+                return str(error)
+
+        elif suffix == ".json":
+            try:
+                json.loads(text)
+            except ValueError as error:
+                return str(error)
+
+        elif suffix in (".js", ".mjs", ".cjs") and shutil.which("node"):
+            return _node_check(suffix, text)
+
+        return ""
 
     def list(self, path):
         raw = str(path)
@@ -559,10 +973,117 @@ class Workspace:
 
         return old, new
 
+    def plan_replace(self, path, find, put):
+        """(old text, new text, places) for replacing find everywhere."""
+
+        old = self.load(path)[0]
+
+        if not find:
+            raise ToolError("the old text is empty")
+
+        if find == put:
+            raise ToolError("old and new are the same text")
+
+        # "--" or "&" is in a page's markup as much as in its text: replacing
+        # it everywhere breaks comments, class names and entities.
+        if sum(char.isalnum() for char in find) < 3:
+            raise ToolError(
+                "the old text {!r} is too short to replace everywhere: it also "
+                "matches markup and code. Use <edit> on the lines you mean".format(find)
+            )
+
+        places = old.count(find)
+
+        if not places:
+            message = "the text {!r} is not in {}".format(find, self.show(path))
+            other = sorted(set(re.findall(re.escape(find), old, re.I)))
+
+            if other:
+                message += ". It does contain: {}".format(", ".join(repr(o) for o in other[:5]))
+
+            raise ToolError(message)
+
+        return old, old.replace(find, put), places
+
+    def near(self, path, search, context=2, limit=3):
+        """The parts of a file that most resemble a SEARCH text that did not
+        match, numbered, or "" when nothing comes close."""
+
+        try:
+            rows = self.load(path)[0].split("\n")
+        except ToolError:
+            return ""
+
+        wanted = [line.strip() for line in search.split("\n") if len(line.strip()) > 3][:4]
+        stripped = [row.strip() for row in rows]
+        found = []
+
+        for line in wanted:
+            for close in difflib.get_close_matches(line, set(stripped), n=2, cutoff=0.6):
+                index = stripped.index(close)
+
+                if index not in found:
+                    found.append(index)
+
+        parts = []
+
+        for index in sorted(found[:limit]):
+            first, last = max(0, index - context), min(len(rows), index + context + 1)
+            parts.append("\n".join(
+                "{}: {}".format(number + 1, rows[number][:MAX_LINE_CHARS])
+                for number in range(first, last)
+            ))
+
+        return "\n...\n".join(parts)
+
+    def summary(self, path):
+        """A big file's map alone, for attaching to a request: a whole first
+        page of it as well would crowd out the request itself. None when the
+        file is small enough to attach whole."""
+
+        text = self.load(path)[0]
+
+        if len(text) <= self.result_chars:
+            return None
+
+        rows = text.split("\n")
+        outline = self.outline(path, rows, self.result_chars // 2)
+        shown = self.show(path)
+
+        return Result(
+            "[{} has {} lines, too long to show here. Its map -- line number and "
+            "what is there:]\n{}\n[Read the lines you need with <read path=\"{}\" "
+            "lines=\"FROM-TO\"/>, or find text with <search pattern=\"TEXT\" "
+            "path=\"{}\"/>.]".format(shown, len(rows), outline or "(no map for this kind of file)", shown, shown),
+            "map",
+        )
+
+    def backup(self, path):
+        """Keep the file as it was before its first change in this run."""
+
+        if self.backup_dir is None or not path.is_file():
+            return
+
+        key = os.path.normcase(str(path))
+
+        if key in self.backed_up:
+            return
+
+        self.backed_up.add(key)
+        relative = self.show(path) if self.inside(path) else path.name
+        target = self.backup_dir / relative.replace("..", "_")
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(path), str(target))
+        except OSError:
+            pass
+
     def commit(self, path, text):
         """Write text, keeping the file's own line ends and BOM."""
 
         newline, bom = "\n", False
+        self.backup(path)
 
         if path.is_file():
             try:

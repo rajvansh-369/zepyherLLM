@@ -46,7 +46,10 @@ Without `-y`, `zy -p` can read and search but declines edits and commands.
 
 ## In a session
 
-- `@path` in a request attaches that file. Tab completes paths and commands.
+- A file you name in a request (`fix cart.py`, `src/app.js`, `@notes.txt`) is
+  attached to it, so the model starts from what is really in the file. A big
+  file comes as a map -- line numbers with the functions, classes or visible
+  page text on them -- plus its first part. Tab completes paths after `@`.
 - `!command` runs a command yourself; the model is told what it printed.
 - Esc then Enter adds a line. Shift+Tab cycles the permission mode.
 - Ctrl+C interrupts the answer or the running command; twice at the prompt exits.
@@ -68,6 +71,34 @@ Without `-y`, `zy -p` can read and search but declines edits and commands.
 | `/good`, `/bad` | rate the last plain-chat answer |
 | `/status` | server, model, context |
 | `/exit` | leave |
+
+### What it checks for you
+
+- After every change to a `.py`, `.json` or `.js` file it checks the syntax,
+  and whether a function is now defined twice. A problem goes back to the
+  model with the line, to fix before anything else.
+- An edit sent as plain new code (no SEARCH/REPLACE block) is lined up
+  against the file: the parts left out stay as they are.
+- Files are only changed through its own tools. Shell commands that rewrite
+  files (`Set-Content`, `Out-File`, `sed -i`, ...) are refused: Windows
+  PowerShell writes them in the ANSI code page and corrupts non-English text.
+- Installing packages (`pip install`, `npm install`, ...) always asks first,
+  even with `-y`, and is refused in `zy -p`.
+- If nothing was changed in the end, it says so, whatever the model claims.
+
+### Asking for features
+
+Name the file and the function, and say how to check it:
+`in cart.py add a remove(name) method to Cart, add a test in test_cart.py, run pytest`.
+One feature per request works better than several.
+
+### Asking for renames
+
+The model is a 7B: say what the text is now, not what it stands for.
+`replace Dhruv with Snehal and Aishwarya with Shreya everywhere in index1.html`
+works. `update the bride and groom names` makes it guess which text that is,
+and it guesses badly. Replacement is exact and case-sensitive, so `dhruv` in a
+URL needs its own request. `/undo` reverts the last change.
 
 A `ZYPHER.md` in the project folder is given to the model as project notes.
 

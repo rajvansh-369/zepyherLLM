@@ -3,3 +3,4 @@ __pycache__/
 .memory
 .env
 .logs
+*.egg-info/

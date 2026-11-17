@@ -13,6 +13,7 @@ tags as it is, with no escaping for a small model to get wrong.
 
     <read path="FILE"/>                     <list path="DIR"/>
     <search pattern="TEXT" path="DIR"/>     <run>COMMAND</run>
+    <replace path="FILE" old="TEXT" new="TEXT"/>
     <write path="FILE">CONTENT</write>
     <edit path="FILE">
     <<<<<<< SEARCH
@@ -29,7 +30,7 @@ file content wrapped in ```.
 
 import re
 
-TOOLS = ("read", "list", "search", "run", "write", "edit")
+TOOLS = ("read", "list", "search", "run", "replace", "write", "edit")
 
 # Appended to every message the model reads, so the rule is always the most
 # recent thing it saw. Kept constant: text that never changes stays in the
@@ -69,12 +70,19 @@ the lines to put in their place
 >>>>>>> REPLACE
 </edit>
     Change part of a file.
+<replace path="FILE" old="TEXT" new="TEXT"/>
+    Replace TEXT everywhere it appears in a file. old is the exact text in the file now, new is what it becomes. Use this to rename something that is in many places.
 
 Rules:
 - One tool call per reply, and nothing after it. Never write a result yourself.
-- Never guess what a file contains. Read a file before you edit it.
+- Never guess what a file contains. Read a file before you edit it, and copy the old text from what you read.
+- A file the user names is attached to their message as [file NAME]: use it, do not read it again. A long file comes with a map: line numbers and what is on them.
+- To change a name or a value, first read the file to see what it is now, then replace that current text. Replace the value itself (the name written in the file), never the label next to it.
+- New feature or logic: find where it belongs (search, list), read those files, then add to them with edit. Put new code in a new file with write only when it does not belong in an existing one. Match the style the project already uses.
+- Changing the text of a page: edit the exact lines that hold it. Keep the tags and attributes around it as they are.
+- Change only what the task asks for. Never remove code you were not asked to change.
 - Do not put tool calls in code fences.
-- After changing code, run it or its tests when that is possible.
+- After changing program code, run its tests or the program when that is possible. Do not run pages, styles or text files: there is nothing to run. A syntax error in a change is reported in its result: fix it first.
 - When the task is done, or the question needs no tool, reply in plain text without a tool call, in a few sentences."""
 
 
@@ -155,9 +163,12 @@ XML_BLOCK = re.compile(
     r"<(?:search|old)>\n?(.*?)\n?</(?:search|old)>\s*<(?:replace|new)>\n?(.*?)\n?</(?:replace|new)>",
     re.S | re.I,
 )
+MARKER_LINE = re.compile(r"^(?:<{5,9}|={5,9}|>{5,9})", re.M)
 FENCE_LINE = re.compile(r"^[ \t]*(?:```|~~~)[\w+-]*[ \t]*$")
 
 PATH_KEYS = ("path", "file", "filename", "name", "dir", "folder")
+OLD_KEYS = ("old", "from", "find", "search")
+NEW_KEYS = ("new", "to", "with", "replace")
 PATTERN_KEYS = ("pattern", "text", "query", "q", "regex")
 
 # What old tool calls are cut down to when the conversation is compacted. A
@@ -197,6 +208,10 @@ class Call:
 
             if self.path not in ("", "."):
                 subject += " in " + self.path
+        elif self.name == "replace":
+            subject = "{}: {} -> {}".format(
+                self.path, self.args.get("old", ""), self.args.get("new", "")
+            )
         else:
             subject = self.path or "."
 
@@ -215,6 +230,8 @@ class Call:
             subject = " ".join(self.body.split())[:120]
         elif self.name == "search":
             subject = self.args.get("pattern", "")
+        elif self.name == "replace":
+            subject = "{} in {}".format(self.args.get("old", ""), self.path)[:120]
         else:
             subject = self.path or "."
 
@@ -241,6 +258,12 @@ class Call:
         if name == "run":
             return "<run>{}</run>".format(self.body)
 
+        if name == "replace":
+            return "<replace path={} old={} new={}/>".format(
+                _quoted(self.path), _quoted(self.args.get("old", "")),
+                _quoted(self.args.get("new", "")),
+            )
+
         body = self.body
 
         if elide:
@@ -254,6 +277,18 @@ class Parsed:
     def __init__(self, prose, call):
         self.prose = prose
         self.call = call
+
+
+def _quoted(value):
+    """An attribute value in whichever quotes it does not contain."""
+
+    return "'{}'".format(value) if '"' in value else '"{}"'.format(value)
+
+
+def replace_call(path, old, new):
+    """A <replace> call written out, for telling the model what to send."""
+
+    return "<replace path={} old={} new={}/>".format(_quoted(path), _quoted(old), _quoted(new))
 
 
 def _chomp(text):
@@ -315,8 +350,13 @@ def _unfence(body):
     while lines and not lines[-1].strip():
         lines.pop()
 
-    if len(lines) >= 2 and FENCE_LINE.match(lines[0]) and lines[-1].strip() in ("```", "~~~"):
-        lines = lines[1:-1]
+    # Either end on its own: a reply cut short loses the closing fence, and
+    # a model sometimes forgets the opening one.
+    if lines and FENCE_LINE.match(lines[0]):
+        lines = lines[1:]
+
+    if lines and lines[-1].strip() in ("```", "~~~"):
+        lines = lines[:-1]
 
     return "\n".join(lines)
 
@@ -364,6 +404,31 @@ def parse(text, final=False):
     call.args = _attributes(attribute_text)
     name = call.name
     closing = "</" + name
+
+    # -- replace: everything is in the tag ---------------------
+
+    if name == "replace":
+        raw = {}
+
+        for key, double, single, bare in ATTRIBUTE.findall(attribute_text):
+            raw.setdefault(key.lower(), double or single or bare)
+
+        for target, keys in (("old", OLD_KEYS), ("new", NEW_KEYS)):
+            for key in keys:
+                if key in raw:
+                    call.args[target] = raw[key]
+                    break
+
+        if not call.path:
+            call.error = 'replace needs a path: <replace path="FILE" old="TEXT" new="TEXT"/>'
+        elif not call.args.get("old") or "new" not in call.args:
+            call.error = (
+                'replace needs old and new: <replace path="FILE" old="TEXT" new="TEXT"/>. '
+                "For a change of several lines use <edit>."
+            )
+
+        call.complete = True
+        return Parsed(prose, call)
 
     # -- read, list, search: everything is in the tag ----------
 
@@ -438,7 +503,9 @@ def parse(text, final=False):
                 "that placeholder is not real content. Write the complete, real "
                 "text between the tags."
             )
-        elif name == "edit" and not call.blocks():
+        elif name == "edit" and not call.blocks() and MARKER_LINE.search(call.body):
+            # A block that is there but broken. Without any markers at all
+            # the body is taken as the new code itself (see merge_loose).
             call.error = (
                 "edit needs a block of this shape between the tags:\n"
                 "<<<<<<< SEARCH\nexisting lines\n=======\nnew lines\n>>>>>>> REPLACE"
