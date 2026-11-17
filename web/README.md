@@ -38,11 +38,30 @@ For a production build: `npm run build`, then `npm run preview`
 | Stop / continue | Stop (or Esc) cancels the generation on the server at once; Continue resumes a stopped or budget-capped answer inside the same reply |
 | Edit / regenerate | edit any of your messages and resend from there; regenerate the last answer |
 | Web lookup | Auto / Always / Off per message; a "Searching the web…" status while it runs; sources listed under the answer |
-| Memory | 👍 / 👎 on answers steers recall; the brain button shows what is known about you, remembered answers, and server settings |
-| Status | green dot when the model is ready, a banner while it loads or when the API is down; GPU throttling is reported under the answer |
-| Layout | light / dark / system theme; works down to phone width |
+| Memory | thumbs up / down on answers steers recall; **Memory & settings** shows what is known about you, remembered answers, engine details and server settings |
+| Status | the model pill shows ready / loading / offline (click it for engine details); a banner while it loads or when the API is down; GPU throttling is reported under the answer |
+| Layout | light / dark / system theme; collapsible sidebar; a drawer and bottom sheet at phone width |
 
-Shortcuts: Enter send · Shift+Enter new line · Esc stop · Ctrl+Shift+O new chat.
+Shortcuts: Enter send · Shift+Enter new line · Esc stop · Ctrl+Shift+O new chat ·
+Ctrl+K search chats · `/` jump to the message box.
+
+## Design
+
+The look follows the "AI-Native UI + Minimalism" system (from the UI UX Pro Max
+design database, product type *AI/Chatbot Platform*): minimal chrome, neutral
+surfaces with one indigo-to-violet accent, a near-black dark theme, Inter for
+text and JetBrains Mono for code, Lucide icons.
+
+- Every colour is a token at the top of `src/styles.css`; text pairs meet
+  WCAG AA (4.5:1) in both themes.
+- Fonts and icons are bundled (Fontsource, lucide-react). The page requests
+  nothing from any CDN, so it works offline and nothing leaks.
+- Effects are deliberately light on the GPU, because the same GPU is running
+  the model: the ambient glow is a static gradient, blur is used only behind
+  dialogs, and the only looping animations are small loading indicators.
+- Keyboard and screen-reader support: visible focus rings, labelled icon
+  buttons, a native modal dialog, live announcements, reduced-motion respected,
+  44px targets on touch screens.
 
 ## How it connects
 
@@ -65,13 +84,16 @@ src/
   api.ts                  every API call; SSE stream parsing
   store.ts                localStorage for chats and preferences
   markdown.ts             marked + highlight.js + DOMPurify
+  theme.ts                light / dark, view transitions
+  toast.tsx               brief confirmations and errors
+  brand.tsx               the logo mark
   types.ts                API and app shapes
-  App.tsx                 state: chats, streaming, health
+  App.tsx                 state: chats, streaming, health, shortcuts
   components/
-    Sidebar.tsx           chat list
+    Sidebar.tsx           chat list, search, theme switch
     MessageView.tsx       one message with its actions, sources, stats
     Markdown.tsx          rendered answer, code copy
-    Composer.tsx          input, web / style toggles, send / stop
-    MemoryPanel.tsx       notes, remembered answers, server settings
-  styles.css
+    Composer.tsx          input, web / style choices, send / stop
+    SettingsDialog.tsx    notes, remembered answers, engine and server settings
+  styles.css              design tokens and every style
 ```

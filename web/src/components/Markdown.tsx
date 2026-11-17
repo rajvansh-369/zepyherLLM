@@ -13,6 +13,8 @@ interface Props {
 export const Markdown = memo(function Markdown({ text, streaming }: Props) {
   const [html, setHtml] = useState(() => renderMarkdown(text));
   const frame = useRef<number | null>(null);
+  const latest = useRef(text);
+  latest.current = text;
 
   useEffect(() => {
     if (!streaming) {
@@ -23,14 +25,17 @@ export const Markdown = memo(function Markdown({ text, streaming }: Props) {
     if (frame.current === null) {
       frame.current = requestAnimationFrame(() => {
         frame.current = null;
-        setHtml(renderMarkdown(text));
+        setHtml(renderMarkdown(latest.current));
       });
     }
   }, [text, streaming]);
 
   useEffect(
     () => () => {
+      // Clear the marker as well as the frame: left set, nothing would ever
+      // schedule another render (React's dev double-mount runs this once).
       if (frame.current !== null) cancelAnimationFrame(frame.current);
+      frame.current = null;
     },
     [],
   );
@@ -47,12 +52,18 @@ export const Markdown = memo(function Markdown({ text, streaming }: Props) {
 function copyCode(event: React.MouseEvent<HTMLDivElement>) {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-copy]");
   const code = button?.closest(".code")?.querySelector("code");
+  const label = button?.querySelector("span");
 
-  if (!button || !code) return;
+  if (!button || !code || !label) return;
 
   copyText(code.textContent ?? "").then((ok) => {
-    button.textContent = ok ? "Copied" : "Failed";
-    setTimeout(() => (button.textContent = "Copy"), 1500);
+    button.classList.toggle("copied", ok);
+    label.textContent = ok ? "Copied" : "Failed";
+
+    setTimeout(() => {
+      button.classList.remove("copied");
+      label.textContent = "Copy";
+    }, 1500);
   });
 }
 

@@ -8,7 +8,12 @@ import type { Conversation, Prefs } from "./types";
 const CONVERSATIONS = "zypher.conversations.v1";
 const PREFS = "zypher.prefs.v1";
 
-export const DEFAULT_PREFS: Prefs = { web: "auto", sampling: "auto", theme: "system" };
+export const DEFAULT_PREFS: Prefs = {
+  web: "auto",
+  sampling: "auto",
+  theme: "system",
+  sidebarCollapsed: false,
+};
 
 function read<T>(key: string, fallback: T): T {
   try {

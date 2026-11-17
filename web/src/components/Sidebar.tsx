@@ -1,20 +1,43 @@
 import { useState } from "react";
-import type { Conversation } from "../types";
-import { EditIcon, PlusIcon, TrashIcon } from "../icons";
+import {
+  MessageSquare,
+  Monitor,
+  Moon,
+  PanelLeftClose,
+  Pencil,
+  Search,
+  SlidersHorizontal,
+  SquarePen,
+  Sun,
+  Trash2,
+} from "lucide-react";
+import { Logo } from "../brand";
+import type { Conversation, Prefs } from "../types";
 
 interface Props {
   conversations: Conversation[];
   activeId: string | null;
   open: boolean;
+  hidden: boolean;
   streamingId: string | null;
+  theme: Prefs["theme"];
+  searchRef: React.RefObject<HTMLInputElement | null>;
   onNew: () => void;
   onSelect: (id: string) => void;
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
   onClose: () => void;
+  onTheme: (theme: Prefs["theme"]) => void;
+  onSettings: () => void;
 }
 
 const DAY = 86_400_000;
+
+const THEMES = [
+  { value: "system", label: "Match system", icon: Monitor },
+  { value: "light", label: "Light", icon: Sun },
+  { value: "dark", label: "Dark", icon: Moon },
+] as const;
 
 function group(updated: number): string {
   const today = new Date().setHours(0, 0, 0, 0);
@@ -29,12 +52,17 @@ export function Sidebar({
   conversations,
   activeId,
   open,
+  hidden,
   streamingId,
+  theme,
+  searchRef,
   onNew,
   onSelect,
   onRename,
   onDelete,
   onClose,
+  onTheme,
+  onSettings,
 }: Props) {
   const [query, setQuery] = useState("");
   const [renaming, setRenaming] = useState<string | null>(null);
@@ -61,90 +89,169 @@ export function Sidebar({
   return (
     <>
       <div className={"scrim" + (open ? " show" : "")} onClick={onClose} />
-      <aside className={"sidebar" + (open ? " open" : "")}>
-        <div className="brand">
-          <span className="logo">Z</span> zypherLL
+
+      {/* inert while out of sight, so Tab never lands on something invisible */}
+      <aside className={"sidebar" + (open ? " open" : "")} aria-label="Chats" inert={hidden}>
+        <div className="side-head">
+          <Logo size={28} />
+          <span className="wordmark">
+            zypher<b>LL</b>
+          </span>
+          <button
+            className="icon-btn"
+            title="Hide sidebar"
+            aria-label="Hide sidebar"
+            onClick={onClose}
+          >
+            <PanelLeftClose size={18} />
+          </button>
         </div>
 
         <button className="new-chat" onClick={onNew}>
-          <PlusIcon size={16} /> New chat
+          <SquarePen size={16} />
+          New chat
+          <span className="keys" aria-hidden="true">
+            <kbd>Ctrl</kbd>
+            <kbd>⇧</kbd>
+            <kbd>O</kbd>
+          </span>
         </button>
 
-        <input
-          className="search"
-          type="search"
-          placeholder="Search chats"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
+        <label className="search">
+          <Search size={15} />
+          <input
+            ref={searchRef}
+            type="search"
+            placeholder="Search chats"
+            aria-label="Search chats"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && query) {
+                e.stopPropagation();
+                setQuery("");
+              }
+            }}
+          />
+          <span className="keys" aria-hidden="true">
+            <kbd>Ctrl</kbd>
+            <kbd>K</kbd>
+          </span>
+        </label>
 
-        <nav className="conversations">
+        <nav className="conversations" aria-label="Chat history">
           {groups.length === 0 && (
-            <div className="empty-list">{q ? "No chats match." : "No chats yet."}</div>
+            <div className="empty">
+              <MessageSquare size={22} />
+              {q ? "No chats match that search." : "Your chats will appear here."}
+            </div>
           )}
 
           {groups.map(([name, items]) => (
             <div key={name}>
               <div className="group">{name}</div>
-              {items.map((c) => (
-                <div
-                  key={c.id}
-                  className={"conv" + (c.id === activeId ? " active" : "")}
-                  onClick={() => renaming !== c.id && onSelect(c.id)}
-                >
-                  {renaming === c.id ? (
-                    <input
-                      className="rename"
-                      autoFocus
-                      defaultValue={c.title}
-                      onClick={(e) => e.stopPropagation()}
-                      onBlur={(e) => {
-                        onRename(c.id, e.target.value);
-                        setRenaming(null);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                        if (e.key === "Escape") setRenaming(null);
-                      }}
-                    />
-                  ) : (
-                    <span className="conv-title">
-                      {c.id === streamingId && <span className="dot live" />}
-                      {c.title}
-                    </span>
-                  )}
 
-                  {confirming === c.id ? (
-                    <span className="conv-actions show" onClick={(e) => e.stopPropagation()}>
-                      <button className="mini danger" onClick={() => onDelete(c.id)}>
-                        Delete
-                      </button>
-                      <button className="mini" onClick={() => setConfirming(null)}>
-                        Keep
-                      </button>
-                    </span>
-                  ) : (
-                    <span className="conv-actions" onClick={(e) => e.stopPropagation()}>
-                      <button className="icon-btn" title="Rename" onClick={() => setRenaming(c.id)}>
-                        <EditIcon size={14} />
-                      </button>
+              {items.map((c) => {
+                const active = c.id === activeId;
+                const asking = confirming === c.id;
+
+                return (
+                  <div
+                    key={c.id}
+                    className={
+                      "conv" + (active ? " active" : "") + (asking ? " confirming" : "")
+                    }
+                  >
+                    {renaming === c.id ? (
+                      <input
+                        className="rename"
+                        autoFocus
+                        aria-label="Chat title"
+                        defaultValue={c.title}
+                        onFocus={(e) => e.target.select()}
+                        onBlur={(e) => {
+                          onRename(c.id, e.target.value);
+                          setRenaming(null);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                          if (e.key === "Escape") {
+                            e.stopPropagation();
+                            setRenaming(null);
+                          }
+                        }}
+                      />
+                    ) : (
                       <button
-                        className="icon-btn"
-                        title="Delete"
-                        disabled={c.id === streamingId}
-                        onClick={() => setConfirming(c.id)}
+                        className="conv-main"
+                        title={c.title}
+                        aria-current={active ? "true" : undefined}
+                        onClick={() => onSelect(c.id)}
+                        onDoubleClick={() => setRenaming(c.id)}
                       >
-                        <TrashIcon size={14} />
+                        {c.id === streamingId && <span className="dot live" />}
+                        <span className="conv-title">{c.title}</span>
                       </button>
-                    </span>
-                  )}
-                </div>
-              ))}
+                    )}
+
+                    {renaming === c.id ? null : asking ? (
+                      <span className="conv-actions show">
+                        <button className="mini danger" autoFocus onClick={() => onDelete(c.id)}>
+                          Delete
+                        </button>
+                        <button className="mini" onClick={() => setConfirming(null)}>
+                          Cancel
+                        </button>
+                      </span>
+                    ) : (
+                      <span className="conv-actions">
+                        <button
+                          className="icon-btn xs"
+                          title="Rename"
+                          aria-label={`Rename ${c.title}`}
+                          onClick={() => setRenaming(c.id)}
+                        >
+                          <Pencil size={14} />
+                        </button>
+                        <button
+                          className="icon-btn xs"
+                          title="Delete"
+                          aria-label={`Delete ${c.title}`}
+                          disabled={c.id === streamingId}
+                          onClick={() => setConfirming(c.id)}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           ))}
         </nav>
 
-        <div className="sidebar-foot">Chats are saved in this browser only.</div>
+        <div className="side-foot">
+          <button className="foot-btn" onClick={onSettings}>
+            <SlidersHorizontal size={16} />
+            Memory &amp; settings
+          </button>
+
+          <div className="theme-switch" role="radiogroup" aria-label="Theme">
+            {THEMES.map(({ value, label, icon: Icon }) => (
+              <button
+                key={value}
+                role="radio"
+                aria-checked={theme === value}
+                aria-label={label}
+                title={label}
+                onClick={() => onTheme(value)}
+              >
+                <Icon size={14} />
+              </button>
+            ))}
+          </div>
+        </div>
       </aside>
     </>
   );

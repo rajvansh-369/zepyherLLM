@@ -1,23 +1,42 @@
-import { useState } from "react";
-import type { Message } from "../types";
-import { ContinueIcon, CopyIcon, DownIcon, EditIcon, RetryIcon, UpIcon } from "../icons";
+import { memo, useState } from "react";
+import {
+  ArrowRight,
+  Bookmark,
+  Check,
+  CircleAlert,
+  Copy,
+  Globe,
+  History,
+  Link2,
+  LoaderCircle,
+  Pencil,
+  RefreshCw,
+  Thermometer,
+  ThumbsDown,
+  ThumbsUp,
+} from "lucide-react";
+import type { Message, StatusInfo } from "../types";
 import { Markdown, copyText } from "./Markdown";
 
 interface Props {
   message: Message;
   streaming: boolean;
-  status: string | null;
+  status: StatusInfo | null;
   isLast: boolean;
   busy: boolean;
   onRetry: () => void;
   onContinue: () => void;
-  onEdit: (text: string) => void;
-  onRate: (rating: "good" | "bad") => void;
+  onEdit: (id: string, text: string) => void;
+  onRate: (id: string, rating: "good" | "bad") => void;
 }
 
-export function MessageView(props: Props) {
+/**
+ * One turn. Memoized: while an answer streams, only the message being
+ * written re-renders, however long the conversation above it is.
+ */
+export const MessageView = memo(function MessageView(props: Props) {
   return props.message.role === "user" ? <UserMessage {...props} /> : <AssistantMessage {...props} />;
-}
+});
 
 function UserMessage({ message, busy, onEdit }: Props) {
   const [editing, setEditing] = useState(false);
@@ -25,9 +44,9 @@ function UserMessage({ message, busy, onEdit }: Props) {
 
   if (editing) {
     const save = () => {
-      if (!draft.trim()) return;
+      if (!draft.trim() || busy) return;
       setEditing(false);
-      onEdit(draft.trim());
+      onEdit(message.id, draft.trim());
     };
 
     return (
@@ -36,21 +55,25 @@ function UserMessage({ message, busy, onEdit }: Props) {
           <textarea
             value={draft}
             autoFocus
+            aria-label="Edit message"
             rows={Math.min(12, draft.split("\n").length + 1)}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 save();
               }
-              if (e.key === "Escape") setEditing(false);
+              if (e.key === "Escape") {
+                e.stopPropagation();
+                setEditing(false);
+              }
             }}
           />
           <div className="edit-actions">
-            <button className="btn ghost" onClick={() => setEditing(false)}>
+            <button className="btn ghost sm" onClick={() => setEditing(false)}>
               Cancel
             </button>
-            <button className="btn primary" onClick={save} disabled={busy || !draft.trim()}>
+            <button className="btn primary sm" onClick={save} disabled={busy || !draft.trim()}>
               Send
             </button>
           </div>
@@ -62,22 +85,29 @@ function UserMessage({ message, busy, onEdit }: Props) {
   return (
     <div className="msg user">
       <div className="bubble">{message.content}</div>
-      <div className="actions hover">
+      <div className="actions quiet">
         <CopyButton text={message.content} />
         <button
           className="icon-btn"
           title="Edit and resend"
+          aria-label="Edit and resend"
           disabled={busy}
           onClick={() => {
             setDraft(message.content);
             setEditing(true);
           }}
         >
-          <EditIcon size={15} />
+          <Pencil size={15} />
         </button>
       </div>
     </div>
   );
+}
+
+function StatusIcon({ stage }: { stage: string }) {
+  if (stage === "searching") return <Globe size={14} />;
+  if (stage === "recalled") return <History size={14} />;
+  return <LoaderCircle size={14} className="spin" />;
 }
 
 function AssistantMessage({
@@ -94,11 +124,20 @@ function AssistantMessage({
   const empty = !message.content;
 
   return (
-    <div className="msg assistant">
-      {streaming && status && <div className="status">{status}</div>}
+    <article className="msg assistant" aria-busy={streaming}>
+      <header className="msg-head">
+        <span className={"orb" + (streaming ? " live" : "")} aria-hidden="true" />
+        <span className="msg-name">zypherLL</span>
+        {streaming && status && (
+          <span className="status">
+            <StatusIcon stage={status.stage} />
+            <span className="shimmer">{status.text}</span>
+          </span>
+        )}
+      </header>
 
-      {streaming && empty && !status && (
-        <div className="typing" aria-label="Thinking">
+      {streaming && empty && (
+        <div className="typing" aria-hidden="true">
           <span />
           <span />
           <span />
@@ -108,91 +147,128 @@ function AssistantMessage({
       {!empty && <Markdown text={message.content} streaming={streaming} />}
 
       {message.error && (
-        <div className="error-box">
-          <strong>Something went wrong.</strong> {message.error}
+        <div className="note bad" role="alert">
+          <CircleAlert size={16} />
+          <div>
+            <strong>Something went wrong.</strong> {message.error}
+          </div>
+          {isLast && (
+            <button className="btn sm" disabled={busy} onClick={onRetry}>
+              <RefreshCw size={14} /> Try again
+            </button>
+          )}
         </div>
       )}
 
       {!streaming && meta && meta.sources.length > 0 && (
-        <div className="sources">
-          <div className="sources-title">{meta.cited ? "Sources" : "Searched"}</div>
+        <section className="sources" aria-label={meta.cited ? "Sources" : "Pages searched"}>
+          <div className="sources-title">
+            <Link2 size={13} />
+            {meta.cited ? "Sources" : "Searched"}
+          </div>
           <ol>
             {meta.sources.map((source) => (
-              <li key={source.n} value={source.n}>
-                <a href={source.url} target="_blank" rel="noopener noreferrer">
-                  {source.title || source.url}
+              <li key={source.n}>
+                <a className="source" href={source.url} target="_blank" rel="noopener noreferrer">
+                  <span className="source-n">{source.n}</span>
+                  <span className="source-body">
+                    <span className="source-title">{source.title || source.url}</span>
+                    <span className="source-host">{host(source.url)}</span>
+                  </span>
                 </a>
-                <span className="host">{host(source.url)}</span>
               </li>
             ))}
           </ol>
-        </div>
+        </section>
       )}
 
-      {!streaming && meta?.notes_captured.map((note) => (
-        <div key={note} className="note-chip">
-          Remembered: {note}
-        </div>
-      ))}
+      {!streaming &&
+        meta?.notes_captured.map((note) => (
+          <div key={note} className="pill-note">
+            <Bookmark size={13} />
+            Remembered: {note}
+          </div>
+        ))}
 
       {!streaming && meta?.throttled && (
-        <div className="warn-box">
-          The GPU is at {meta.throttled.gpu_temp_c}°C and has throttled itself: this ran at{" "}
-          {meta.tokens_per_second.toFixed(0)} tok/s against{" "}
-          {meta.throttled.usual_tokens_per_second.toFixed(0)} when cool. Give the laptop a minute
-          or more airflow.
+        <div className="note warn">
+          <Thermometer size={16} />
+          <div>
+            The GPU is at {meta.throttled.gpu_temp_c}°C and has throttled itself: this ran at{" "}
+            {meta.tokens_per_second.toFixed(0)} tok/s against{" "}
+            {meta.throttled.usual_tokens_per_second.toFixed(0)} when cool. Give the laptop a minute
+            or more airflow.
+          </div>
         </div>
       )}
 
       {!streaming && (
-        <div className={"actions" + (isLast ? "" : " hover")}>
+        <div className={"actions" + (isLast ? "" : " quiet")}>
           {!empty && <CopyButton text={message.content} />}
 
           {isLast && (
-            <button className="icon-btn" title="Regenerate" disabled={busy} onClick={onRetry}>
-              <RetryIcon size={15} />
+            <button
+              className="icon-btn"
+              title="Regenerate"
+              aria-label="Regenerate answer"
+              disabled={busy}
+              onClick={onRetry}
+            >
+              <RefreshCw size={15} />
             </button>
           )}
 
           {meta?.memory_id != null && (
             <>
               <button
-                className={"icon-btn" + (message.rating === "good" ? " active" : "")}
-                title="Good answer -- recall it more"
-                onClick={() => onRate("good")}
+                className={"icon-btn" + (message.rating === "good" ? " is-on" : "")}
+                title="Good answer: recall it more"
+                aria-label="Good answer"
+                aria-pressed={message.rating === "good"}
+                onClick={() => onRate(message.id, "good")}
               >
-                <UpIcon size={15} />
+                <ThumbsUp size={15} />
               </button>
               <button
-                className={"icon-btn" + (message.rating === "bad" ? " active bad" : "")}
-                title="Bad answer -- never recall it"
-                onClick={() => onRate("bad")}
+                className={"icon-btn" + (message.rating === "bad" ? " is-on bad" : "")}
+                title="Bad answer: never recall it"
+                aria-label="Bad answer"
+                aria-pressed={message.rating === "bad"}
+                onClick={() => onRate(message.id, "bad")}
               >
-                <DownIcon size={15} />
+                <ThumbsDown size={15} />
               </button>
             </>
           )}
 
-          {isLast && message.finish === "length" && !message.error && (
-            <button className="btn small" disabled={busy} onClick={onContinue}>
-              <ContinueIcon size={14} /> Continue
+          {isLast && message.finish === "length" && !message.error && !empty && (
+            <button className="btn soft sm" disabled={busy} onClick={onContinue}>
+              Continue <ArrowRight size={14} />
             </button>
           )}
 
           {usage && usage.completion_tokens > 0 && meta && (
-            <span className="stats">
-              {usage.completion_tokens} tokens · {meta.tokens_per_second.toFixed(1)} tok/s
-              {usage.prompt_tokens_details?.cached_tokens
-                ? ` · ${usage.prompt_tokens_details.cached_tokens}/${usage.prompt_tokens} cached`
-                : ""}
-              {meta.recalled ? ` · ${meta.recalled} recalled` : ""}
-              {message.stopped ? " · stopped" : ""}
+            <span className="stats" title={details(message)}>
+              {usage.completion_tokens} tokens · {meta.tokens_per_second.toFixed(1)} tok/s ·{" "}
+              {meta.seconds.toFixed(1)}s{message.stopped ? " · stopped" : ""}
             </span>
           )}
         </div>
       )}
-    </div>
+    </article>
   );
+}
+
+function details({ meta, usage }: Message): string {
+  if (!meta || !usage) return "";
+
+  const cached = usage.prompt_tokens_details?.cached_tokens ?? 0;
+
+  return [
+    `Prompt: ${usage.prompt_tokens} tokens (${cached} already cached)`,
+    `Style: ${meta.sampling}`,
+    `Memories recalled: ${meta.recalled}`,
+  ].join("\n");
 }
 
 function CopyButton({ text }: { text: string }) {
@@ -200,8 +276,9 @@ function CopyButton({ text }: { text: string }) {
 
   return (
     <button
-      className="icon-btn"
+      className={"icon-btn" + (done ? " is-on" : "")}
       title={done ? "Copied" : "Copy"}
+      aria-label={done ? "Copied" : "Copy message"}
       onClick={() =>
         copyText(text).then((ok) => {
           if (!ok) return;
@@ -210,7 +287,7 @@ function CopyButton({ text }: { text: string }) {
         })
       }
     >
-      {done ? <span className="tick">✓</span> : <CopyIcon size={15} />}
+      {done ? <Check size={15} /> : <Copy size={15} />}
     </button>
   );
 }

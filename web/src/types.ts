@@ -104,4 +104,12 @@ export interface Prefs {
   web: WebMode;
   sampling: Sampling;
   theme: "system" | "light" | "dark";
+  /** Desktop only: the sidebar is tucked away. */
+  sidebarCollapsed: boolean;
+}
+
+/** What the assistant is doing before or while it writes. */
+export interface StatusInfo {
+  stage: string;
+  text: string;
 }
