@@ -61,8 +61,9 @@ API_KEY = os.environ.get("ZYPHER_API_KEY") or None
 HOST = os.environ.get("ZYPHER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ZYPHER_PORT", "8000"))
 
-# The name clients pass as "model". There is only one.
-MODEL_ID = "zephyr-7b"
+# The name clients pass as "model". There is only one; set ZYPHER_MODEL_ID
+# when the GGUF below is another model, so /v1/models says which.
+MODEL_ID = os.environ.get("ZYPHER_MODEL_ID", "zephyr-7b")
 
 
 # ============================================================
@@ -275,10 +276,14 @@ SAMPLING = {
 # to the answer's own tokens only -- see GeneratedRepetitionPenalty.
 REPETITION_PENALTY = 1.05
 
-# Zephyr's role markers. The model occasionally writes one instead of ending
-# its turn and goes on to invent the user's next message; generation stops at
-# the marker, and it never reaches the screen or the stored answer.
-STOP_STRINGS = ("<|user|>", "<|system|>", "<|assistant|>")
+# Role markers: Zephyr's, then ChatML's (Qwen and most newer models). A model
+# occasionally writes one instead of ending its turn and goes on to invent the
+# user's next message; generation stops at the marker, and it never reaches
+# the screen or the stored answer.
+STOP_STRINGS = (
+    "<|user|>", "<|system|>", "<|assistant|>",
+    "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+)
 
 # Prompt tokens kept before the oldest turns are dropped. Bounds the KV
 # cache, which is what actually runs a small GPU out of memory mid-chat.

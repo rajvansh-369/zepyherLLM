@@ -969,7 +969,12 @@ class Workspace:
                 raise ToolError("{}{}".format(error, where))
 
         if new == old:
-            raise ToolError("that edit changes nothing: the new lines equal the old ones")
+            raise ToolError(
+                "that edit changes nothing: the file already has these lines. "
+                "If a test still fails, the code may be right and the test "
+                "wrong: work out the expected value by hand and fix whichever "
+                "is wrong"
+            )
 
         return old, new
 

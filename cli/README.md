@@ -102,6 +102,21 @@ URL needs its own request. `/undo` reverts the last change.
 
 A `ZYPHER.md` in the project folder is given to the model as project notes.
 
+### Which model
+
+zy works with whatever GGUF the API runs. For coding, Qwen2.5-Coder 7B is far
+stronger than the default Zephyr 7B and fits the same 6 GB card -- set this in
+the zypherLL `.env` and restart the API (it downloads 4.7 GB once):
+
+```
+ZYPHER_MODEL_PATH=D:\AI\Models\qwen2.5-coder-7b-instruct
+ZYPHER_GGUF_REPO=bartowski/Qwen2.5-Coder-7B-Instruct-GGUF
+ZYPHER_GGUF_FILE=Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
+ZYPHER_MODEL_ID=qwen2.5-coder-7b
+```
+
+Remove those lines to go back to Zephyr.
+
 ## Configuration
 
 The shell environment wins, then `cli/.env`, then `~/.zypher/.env`, then the

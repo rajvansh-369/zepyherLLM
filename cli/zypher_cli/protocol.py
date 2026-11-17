@@ -1,8 +1,9 @@
 """
 The tool protocol: what the model is told, and how its replies are read.
 
-Zephyr 7B has no native function calling, and told about tools in the system
-prompt alone it ignores them and answers as a chat model would. What does work
+Written for Zephyr 7B, which has no native function calling and, told about
+tools in the system prompt alone, ignores them and answers as a chat model
+would; Qwen2.5-Coder follows the same protocol. What does work
 is showing it: a short worked example ahead of the real conversation, in the
 same shape real turns take. From that it reliably opens its reply with a tool
 call -- and then tends to carry on and invent the result. So the reader here
@@ -83,6 +84,7 @@ Rules:
 - Change only what the task asks for. Never remove code you were not asked to change.
 - Do not put tool calls in code fences.
 - After changing program code, run its tests or the program when that is possible. Do not run pages, styles or text files: there is nothing to run. A syntax error in a change is reported in its result: fix it first.
+- When a test fails, decide whether the code or the test is wrong before changing anything: work out the right value by hand, step by step. Fix the one that is wrong.
 - When the task is done, or the question needs no tool, reply in plain text without a tool call, in a few sentences."""
 
 
