@@ -86,17 +86,79 @@ python main.py
 
 ## Coding agent in the terminal
 
-`zy` reads, edits and runs code in whatever folder you start it in. It starts
-the API by itself if it is not running.
+`zy` reads, edits and runs code in whatever folder you start it in. No web
+app needed.
+
+### One-time setup
+
+1. Do steps 1 and 2 of the one-time setup above (Python dependencies and
+   `.env`), if you have not already.
+
+2. Install the `zy` command:
+   ```bash
+   cd D:\GIT\zypherLL
+   pip install -e cli
+   ```
+   Keep the `-e`: it is how `zy` finds this folder, to read the API key from
+   `.env` and to start the API.
+
+3. Check it:
+   ```bash
+   zy --version
+   ```
+   If `zy` is not found, Python's `Scripts` folder is not on your PATH. Use
+   `python -m zypher_cli` from `D:\GIT\zypherLL\cli` instead, with `-C` for
+   the project folder.
+
+### Each time
+
+1. Go to the project you want to work on and start it:
+   ```bash
+   cd D:\path\to\a\project
+   zy
+   ```
+   If the API is not running, `zy` starts it in the background and waits for
+   the model (1-2 minutes after a reboot, seconds otherwise). An API you
+   started yourself with `python main.py serve` is used as it is.
+
+2. Type what you want at the `>` prompt, for example
+   `fix the failing test in tests/test_calc.py`.
+
+3. Before it changes a file or runs a command it shows the change and asks:
+   `y` yes, `a` always, `n` no -- or type what it should do instead.
+
+4. Useful while it runs:
+   - `@calc.py` in a request attaches that file
+   - `!pytest -q` runs a command yourself
+   - `/undo` undoes the last file change
+   - `/help` lists every command
+   - Ctrl+C interrupts the answer; Ctrl+D or `/exit` leaves
+
+### Other ways to start
 
 ```bash
-cd D:\GIT\zypherLL
-pip install -e cli        # once
-cd D:\path\to\a\project
-zy
+zy "add type hints to calc.py"     # start with a request
+zy -c                              # carry on this folder's last conversation
+zy -p "explain main.py"            # one answer, then exit
+git diff | zy -p "review this"     # pipe something in
+zy -p -y "fix the lint errors"     # -y: change files without asking
+zy --chat                          # plain chat, no tools
 ```
 
-See `cli/README.md`.
+### Stop
+
+`/exit` or Ctrl+D leaves `zy`. An API that `zy` started keeps running in the
+background (it frees the GPU memory by itself when idle). To stop it now, in
+PowerShell:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%main.py serve%'" |
+  ForEach-Object { taskkill /F /T /PID $_.ProcessId }
+```
+
+This ends the API and the model process under it. Its log is `.logs\api.log`.
+
+Full reference: `cli/README.md`.
 
 ## If it doesn't work
 
