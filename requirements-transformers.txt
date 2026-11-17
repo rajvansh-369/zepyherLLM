@@ -1,0 +1,40 @@
+# Extra dependencies for the original engine: ZYPHER_BACKEND=transformers.
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt -r requirements-transformers.txt
+#
+# torch on PyPI ships the CPU build on Windows; for this engine install it
+# first from the wheel index matching your driver, as above.
+#
+# Last verified with torch 2.5.1+cu121 and transformers 4.57 / 5.17, before
+# this engine was moved behind the Engine interface in zypher/model/llm/hf.
+
+# 2.1 for scaled_dot_product_attention (attn_implementation="sdpa"),
+# torch.cuda.OutOfMemoryError and torch.cuda.is_bf16_supported.
+torch>=2.1,<3
+
+# 4.56 renamed from_pretrained's torch_dtype argument to dtype, which the loader
+# passes. DynamicCache.crop -- what reuse_cache() relies on to keep the shared
+# prefix when history is rewritten -- has been there since 4.38; generation.py
+# calls it with a negative count, the form 4.x and 5.x both accept. 5.x is
+# allowed: prompts are encoded from the rendered template rather than through
+# apply_chat_template(tokenize=True), whose return type 5.0 changed.
+transformers>=4.56,<6
+
+# Not imported directly, but transformers requires it for device_map and
+# low_cpu_mem_usage, i.e. for placing the model on the GPU at all.
+accelerate>=0.26,<2
+
+# The 4-bit NF4 path. Anything under 16 GB of VRAM loads through this. 0.43 is
+# the first release with official Windows wheels.
+bitsandbytes>=0.43,<1
+
+# snapshot_download with local_dir resume, and the HF_HUB_DISABLE_XET switch
+# zypher/__init__.py sets before importing it.
+huggingface-hub>=0.30,<2
+
+# Optional, and independent of the engine: the recall encoder run through
+# torch instead of onnxruntime. Only needed for ZYPHER_EMBED_RUNTIME=torch, or
+# for a ZYPHER_EMBED_MODEL that has no ONNX export. It lives in this file
+# because it brings torch into the process, which the default install avoids.
+sentence-transformers>=3.0,<6

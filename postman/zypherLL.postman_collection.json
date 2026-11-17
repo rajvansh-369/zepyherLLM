@@ -1,0 +1,808 @@
+{
+  "info": {
+    "_postman_id": "bc8d61ff-5f61-43ac-82e8-9e79ba68fe99",
+    "name": "zypherLL",
+    "description": "Local Zephyr 7B API (OpenAI-compatible).\n\n1. Start the server: `python main.py serve`\n2. Import `zypherLL.local.postman_environment.json` too and select it, or edit the collection variables.\n3. Set `apiKey` to the same value as `ZYPHER_API_KEY` in `.env` (leave empty if the server runs without one).\n\nEvery request except Health sends `Authorization: Bearer {{apiKey}}` (collection-level auth).\n\nChat requests save the stored exchange's id into `memoryId`, which the Rate requests use.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{apiKey}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8000"
+    },
+    {
+      "key": "apiKey",
+      "value": ""
+    },
+    {
+      "key": "memoryId",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "System",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "Load state (`loading` / `ready` / `error`), device and whether auth is on. No API key needed -- poll it while the model loads.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List models",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/models",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "models"
+              ]
+            },
+            "description": "The one model, in the OpenAI list shape."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get settings",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/settings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "settings"
+              ]
+            },
+            "description": "Server-wide defaults a request gets when it does not say."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Update settings",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/settings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "settings"
+              ]
+            },
+            "description": "Change server-wide defaults. Every field is optional. `web: true` also re-arms lookups paused after network failures. `max_tokens` is the answer budget (like `/tokens N`).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"web\": true,\n  \"memory\": true,\n  \"max_tokens\": 4096\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Chat",
+      "item": [
+        {
+          "name": "Chat",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "Plain question. The router decides whether to search the web; memory recalls similar past exchanges. Response `zypher` carries sources, recall count, captured notes and `memory_id`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"zephyr-7b\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"How do I reverse a list in Python?\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const meta = pm.response.json().zypher || {};",
+                  "if (meta.memory_id) {",
+                  "    pm.collectionVariables.set('memoryId', meta.memory_id);",
+                  "    console.log('memoryId =', meta.memory_id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Chat (streaming)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "Server-sent events in the OpenAI chunk format, ending with `data: [DONE]`. Status chunks (searching / recalled) carry a `zypher` field and an empty delta.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"zephyr-7b\",\n  \"stream\": true,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Write a haiku about local LLMs.\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Chat (force web search)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "`web: true` always searches, even when the router would not or web lookup is off server-wide -- same as `/web <question>`. Answers cite sources as [n].",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"zephyr-7b\",\n  \"web\": true,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"What is the latest stable Python release?\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Chat (multi-turn + system)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "Send the whole conversation each time, as with OpenAI. A system message is appended to the runner's own system prompt, not swapped in for it.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"zephyr-7b\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"Answer in one short paragraph.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"What is a KV cache?\"\n    },\n    {\n      \"role\": \"assistant\",\n      \"content\": \"A KV cache stores the attention keys and values of tokens already processed, so they are not recomputed for each new token.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Why does it run out on small GPUs?\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const meta = pm.response.json().zypher || {};",
+                  "if (meta.memory_id) {",
+                  "    pm.collectionVariables.set('memoryId', meta.memory_id);",
+                  "    console.log('memoryId =', meta.memory_id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Chat (continue a cut-off answer)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "End `messages` with the partial assistant reply to continue it in place, like `continue` in the console. The response content is only the new text -- append it to what you had.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"zephyr-7b\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Write a Python function that checks whether a string is a palindrome.\"\n    },\n    {\n      \"role\": \"assistant\",\n      \"content\": \"```python\\ndef is_palindrome(text):\\n\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Chat (tuned: no memory, creative, budget)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "Runner extensions: `memory: false` skips recall and learning for this call; `sampling` picks `precise` / `balanced` / `creative`; `temperature` / `top_p` override it (`temperature: 0` = greedy). `max_tokens` is capped at the server budget; `min_tokens` forbids ending the answer before that many tokens.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"zephyr-7b\",\n  \"memory\": false,\n  \"web\": false,\n  \"sampling\": \"creative\",\n  \"temperature\": 0.9,\n  \"max_tokens\": 400,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Brainstorm five names for a local AI assistant.\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Chat (long, detailed: min_tokens)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "`min_tokens` forbids the model from ending its turn until the answer is that many tokens long -- for when Zephyr stops too soon (`finish_reason: stop` on a short answer). Capped at `max_tokens` and the server budget (4096 on a 6 GB card). Set it higher than the model has things to say and it pads with repetition; 500-1000 suits a detailed explanation.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"zephyr-7b\",\n  \"min_tokens\": 800,\n  \"max_tokens\": 4096,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Explain Python decorators in detail, with examples.\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "console.log('completion_tokens =', body.usage.completion_tokens, 'finish_reason =', body.choices[0].finish_reason);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Memory",
+      "item": [
+        {
+          "name": "Overview",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/memory",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "memory"
+              ]
+            },
+            "description": "Store stats, and the notes about you that go into every system prompt."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List records",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/memory/records?kind=note&limit=50&offset=0",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "memory",
+                "records"
+              ],
+              "query": [
+                {
+                  "key": "kind",
+                  "value": "note",
+                  "description": "note | exchange (omit for both)"
+                },
+                {
+                  "key": "limit",
+                  "value": "50",
+                  "description": ""
+                },
+                {
+                  "key": "offset",
+                  "value": "0",
+                  "description": ""
+                }
+              ]
+            },
+            "description": "Stored records, newest first. `kind` filters to `note` or `exchange`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Add note",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/memory/notes",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "memory",
+                "notes"
+              ]
+            },
+            "description": "Keep a fact about yourself for good -- same as `/remember`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"I use four-space indentation in Python.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Rate good",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/memory/{{memoryId}}/rate",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "memory",
+                "{{memoryId}}",
+                "rate"
+              ]
+            },
+            "description": "Promote an answer so it surfaces earlier -- same as `/good`. `memoryId` is set by the Chat requests.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"rating\": \"good\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Rate bad",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/memory/{{memoryId}}/rate",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "memory",
+                "{{memoryId}}",
+                "rate"
+              ]
+            },
+            "description": "Exclude an answer from recall -- same as `/bad`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"rating\": \"bad\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Forget last",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/memory?selector=last",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "memory"
+              ],
+              "query": [
+                {
+                  "key": "selector",
+                  "value": "last",
+                  "description": "last | all | free text"
+                }
+              ]
+            },
+            "description": "Drop the most recent memory."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Forget by text",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/memory?selector=indentation",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "memory"
+              ],
+              "query": [
+                {
+                  "key": "selector",
+                  "value": "indentation",
+                  "description": ""
+                }
+              ]
+            },
+            "description": "Drop every memory similar to the text."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Forget all",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/memory?selector=all",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "memory"
+              ],
+              "query": [
+                {
+                  "key": "selector",
+                  "value": "all",
+                  "description": ""
+                }
+              ]
+            },
+            "description": "Wipe the whole store. Cannot be undone."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

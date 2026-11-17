@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+ <meta charset="UTF-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1.0">
+ <title>Portfolio</title>
+ <link rel="stylesheet" href="styles.css">
+ <style>
+    * {
+ margin: 0;
+ padding: 0;
+ box-sizing: border-box;
+}
+
+body {
+ font-size: 16px;
+ line-height: 1.5;
+ color: #333;
+}
+
+a {
+ color: #666;
+ text-decoration: none;
+}
+
+a:hover {
+ color: #444;
+}
+
+/* Header Styles */
+header {
+ background-color: #fff;
+ padding: 20px;
+ box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+}
+
+nav ul {
+ list-style: none;
+ display: flex;
+ justify-content: space-between;
+}
+
+nav li {
+ margin: 0 20px;
+}
+
+nav a {
+ padding: 10px 20px;
+ border-radius: 5px;
+ transition: all 0.3s ease-in-out;
+}
+
+nav a:hover {
+ background-color: #f2f2f2;
+}
+
+/* Main Content Styles */
+main {
+ max-width: 1200px;
+ margin: 0 auto;
+ padding: 40px;
+}
+
+section {
+ padding: 40px;
+ border-bottom: 1px solid #ddd;
+}
+
+#about h2 {
+ text-align: center;
+ margin-top: 0;
+}
+
+.image-container {
+ display: flex;
+ flex-wrap: wrap;
+ align-items: center;
+ justify-content: center;
+ margin: 40px auto;
+}
+
+.image-container img {
+ width: 200px;
+ height: 200px;
+ object-fit: cover;
+ border-radius: 50%;
+ margin-right: 20px;
+}
+
+.image-container h3 {
+ text-align: center;
+ margin-top: 20px;
+}
+
+#projects h2 {
+ text-align: center;
+ margin-top: 0;
+}
+
+.project-container {
+ display: flex;
+ flex-wrap: wrap;
+ justify-content: center;
+}
+
+.project {
+ width: 450px;
+ margin: 20px;
+ text-align: center;
+ border: 2px solid #ddd;
+ border-radius: 5px;
+ overflow: hidden;
+ transition: all 0.3s ease-in-out;
+}
+
+.project:hover {
+ transform: translateY(-5px);
+ box-shadow: 0 5px 10px rgba(0, 0, 0, 0.2);
+}
+
+.project img {
+ width: 100%;
+ height: 200px;
+ object-fit: cover;
+ margin-bottom: 20px;
+}
+
+.project h3{
+ margin-top: 20px;
+}
+
+#skills h2 {
+ text-align: center;
+ margin-top: 0;
+}
+
+.skill-container {
+ display: flex;
+ flex-wrap: wrap;
+ justify-content: center;
+}
+
+.skill {
+ width: 350px;
+ margin: 20px;
+ text-align: center;
+ border: 2px solid #ddd;
+ border-radius: 5px;
+ overflow: hidden;
+ transition: all 0.3s ease-in-out;
+}
+
+.skill:hover {
+ transform: translateY(-5px);
+ box-shadow: 0 5px 10px rgba(0, 0, 0, 0.2);
+}
+
+.skill img {
+ width: 100px;
+ height: 100px;
+ object-fit: contain;
+ margin-bottom: 20px;
+}
+
+.scroll-btn {
+ display: block;
+ margin: 40px auto;
+ padding: 10px 20px;
+ border: 2px solid #666;
+ border-radius: 5px;
+ transition: all 0.3s ease-in-out;
+}
+
+.scroll-btn:hover {
+ background-color: #f2f2f2;
+}
+
+/* Footer Styles */
+footer {
+ background-color: #333;
+ color: #fff;
+ padding: 20px;
+}
+
+/* Form Styles */
+#contact form {
+ max-width: 600px;
+ margin: 0 auto;
+}
+
+label {
+ display: block;
+ margin-bottom: 10px;
+}
+
+input[type="text"], input[type="email"], textarea {
+ width: 100%;
+ padding: 10px;
+ border: 2px solid #ddd;
+ border-radius: 5px;
+ margin-bottom: 20px;
+}
+
+button[type="submit"] {
+ background-color: #666;
+ color: #fff;
+ padding: 10px 20px;
+ border: none;
+ border-radius: 5px;
+ cursor: pointer;
+}
+
+button[type="submit"]:hover {
+ background-color: #444;
+}
+
+ </style>
+</head>
+<body>
+ <!-- Navigation -->
+ <header>
+   <nav>
+     <ul>
+       <li><a href="#about">About</a></li>
+       <li><a href="#projects">Projects</a></li>
+       <li><a href="#skills">Skills</a></li>
+       <li><a href="#contact">Contact</a></li>
+     </ul>
+   </nav>
+ </header>
+
+ <!-- Main Content -->
+ <main>
+   <!-- About Section -->
+   <section id="about">
+     <h2>About Me</h2>
+     <div class="image-container">
+       <img src="your-profile-picture.jpg" alt="Your Profile Picture">
+       <h3>Your Name</h3>
+       <p>Write a short bio about yourself here.</p>
+       <a href="#projects" class="scroll-btn">View My Projects</a>
+     </div>
+   </section>
+
+   <!-- Projects Section -->
+   <section id="projects">
+     <h2>My Projects</h2>
+     <div class="project-container">
+       <div class="project">
+         <img src="project-1.jpg" alt="Project 1">
+         <h3>Project 1 Title</h3>
+         <p>Description of Project 1.</p>
+         <a href="project-1-link.com" target="_blank">View Live</a>
+         <a href="project-1-github.com" target="_blank">View Source Code</a>
+       </div>
+       <div class="project">
+         <img src="project-2.jpg" alt="Project 2">
+         <h3>Project 2 Title</h3>
+         <p>Description of Project 2.</p>
+         <a href="project-2-link.com" target="_blank">View Live</a>
+         <a href="project-2-github.com" target="_blank">View Source Code</a>
+       </div>
+       <div class="project">
+         <img src="project-3.jpg" alt="Project 3">
+         <h3>Project 3 Title</h3>
+         <p>Description of Project 3.</p>
+         <a href="project-3-link.com" target="_blank">View Live</a>
+         <a href="project-3-github.com" target="_blank">View Source Code</a>
+       </div>
+     </div>
+     <a href="#skills" class="scroll-btn">View My Skills</a>
+   </section>
+
+   <!-- Skills Section -->
+   <section id="skills">
+     <h2>My Skills</h2>
+     <div class="skill-container">
+       <div class="skill">
+         <img src="skill-1.png" alt="Skill 1 Logo">
+         <h3>Skill 1</h3>
+         <p>Description of Skill 1.</p>
+       </div>
+       <div class="skill">
+         <img src="skill-2.png" alt="Skill 2 Logo">
+         <h3>Skill 2</h3>
+         <p>Description of Skill 2.</p>
+       </div>
+       <div class="skill">
+         <img src="skill-3.png" alt="Skill 3 Logo">
+         <h3>Skill 3</h3>
+         <p>Description of Skill 3.</p>
+       </div>
+       <div class="skill">
+         <img src="skill-4.png" alt="Skill 4 Logo">
+         <h3>Skill 4</h3>
+         <p>Description of Skill 4.</p>
+       </div>
+     </div>
+     <a href="#contact" class="scroll-btn">Get In Touch</a>
+   </section>
+
+   <!-- Contact Section -->
+   <section id="contact">
+     <h2>Contact Me</h2>
+     <form action="submit-form.php" method="POST">
+       <label for="name">Name:</label>
+       <input type="text" name="name" required>
+       <label for="email">Email:</label>
+       <input type="email" name="email" required>
+       <label for="message">Message:</label>
+       <textarea name="message" required></textarea>
+       <button type="submit">Send Message</button>
+     </form>
+   </section>
+ </main>
+
+ <!-- Footer -->
+ <footer>
+   <p>&copy; Your Name. All rights reserved.</p>
+ </footer>
+
+ <!-- Scripts -->
+ <script src="scripts.js"></script>
+</body>
+</html>

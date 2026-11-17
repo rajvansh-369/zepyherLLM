@@ -14,7 +14,11 @@ Three things make it a feedback loop rather than a log:
     recall, so the model stops being reminded of its own mistakes; a good one
     is promoted and surfaces earlier.
   * Facts the user states about themselves are captured without a rating, so
-    preferences survive 'clear' and restarts.
+    preferences survive 'clear' and restarts. They form a short profile that
+    goes into the system prompt on every turn rather than being recalled by
+    similarity: a preference such as "I always use 4-space indentation" has to
+    apply to "write a function that merges two lists", which it barely
+    resembles.
 
 Everything is CPU-side and additive: embedding a turn costs milliseconds and
 no VRAM, which matters because on a small card the KV cache is what runs out
@@ -26,76 +30,96 @@ import json
 import os
 import re
 import threading
+import zlib
 
 import numpy as np
 
+from zypher.config import (
+    ANSWER_CHAR_BUDGET,
+    DEDUPE_THRESHOLD,
+    EMBED_DIR,
+    EMBED_MODEL,
+    EMBED_RUNTIME,
+    MEMORY_DIR,
+    META_FILE,
+    PROFILE_CHAR_BUDGET,
+    PROFILE_MAX_NOTES,
+    RECALL_CANDIDATES,
+    RECALL_CHAR_BUDGET,
+    RECALL_KEEP,
+    RECALL_THRESHOLD,
+    RECORDS_FILE,
+    SCORE_CLAMP,
+    SCORE_WEIGHT,
+    VECTORS_FILE,
+)
+from zypher.model import fetch
+
 
 # ============================================================
-# CONFIG
+# NOTE CAPTURE
 # ============================================================
-
-MEMORY_DIR = os.environ.get(
-    "ZYPHER_MEMORY_DIR",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".memory"),
-)
-
-RECORDS_FILE = "memory.jsonl"
-VECTORS_FILE = "vectors.npy"
-META_FILE = "meta.json"
-
-# Small, fast, and good enough for "have I been asked this before". 384 dims,
-# ~80 MB, runs on CPU in a few milliseconds per turn.
-EMBED_MODEL = os.environ.get(
-    "ZYPHER_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-)
-
-# How many memories to consider, and how many survive into the prompt.
-RECALL_CANDIDATES = 12
-RECALL_KEEP = 3
-
-# Cosine similarity below this is noise. Injecting a loosely related old
-# answer is worse than injecting nothing: the model treats whatever is in the
-# prompt as relevant and will work it into the reply.
-RECALL_THRESHOLD = 0.42
-
-# Notes are short and always about the user, so they are worth surfacing on a
-# weaker match than a whole past exchange.
-NOTE_THRESHOLD = 0.30
-
-# Hard ceiling on the injected block, in characters. ~1200 chars is ~300
-# tokens, which sits alongside the web context without crowding it out.
-RECALL_CHAR_BUDGET = 1200
-
-# Per-memory cap, so one long answer cannot fill the block on its own.
-ANSWER_CHAR_BUDGET = 400
-
-# A rating nudges ranking without letting a single thumbs-up outrank a much
-# closer match.
-SCORE_WEIGHT = 0.04
-SCORE_CLAMP = 3
-
-# Notes this similar to one already stored are the same note; the new wording
-# replaces the old one instead of adding a near-duplicate row. Exchanges are
-# deduplicated on the question text instead -- see _find_duplicate.
-DEDUPE_THRESHOLD = 0.94
 
 # Sentences that state something durable about the user. Captured as notes so
 # they survive 'clear', which a plain exchange does not: exchanges are only
 # recalled when a later question resembles them, whereas a preference should
 # apply to everything.
-NOTE_PATTERNS = (
-    re.compile(r"\bremember (?:that )?(.+)", re.I),
-    re.compile(r"\bmy name is\s+(.+)", re.I),
-    re.compile(r"\bcall me\s+(.+)", re.I),
-    re.compile(r"\bi(?:'m| am)\s+(?:a|an|the)\s+(.+)", re.I),
-    re.compile(r"\bi prefer\s+(.+)", re.I),
-    re.compile(r"\bi(?:'m| am) (?:working|building)\s+(.+)", re.I),
-    re.compile(r"\bi (?:always|usually|normally)\s+(.+)", re.I),
-    re.compile(r"\bi (?:use|run)\s+(.+)", re.I),
-    re.compile(r"\b(?:don't|do not|never)\s+(.+)", re.I),
+#
+# Every pattern is anchored to the start of the sentence. Matched anywhere,
+# "i am a" caught "so I am a bit lost", "i use" caught "I use this function
+# but it throws", and a bare "don't" caught "I don't understand" -- and each of
+# those then sat in the prompt of every later turn as a fact about the user.
+#
+# Explicit statements are kept as they are. The inferred ones -- a sentence
+# that merely sounds like self-description -- are also run past NOTE_REJECT.
+NOTE_EXPLICIT = (
+    re.compile(r"^(?:please )?remember(?: that|:)? (?!to\b)", re.I),
+    re.compile(r"^my (?:name|job|role|title|time ?zone|os|stack|editor|ide|setup) is\b", re.I),
+    re.compile(r"^(?:you can |please )?call me\b", re.I),
+    re.compile(r"^(?:from now on|going forward|in (?:the )?future)\b", re.I),
+    re.compile(r"^(?:please )?(?:always|never) (?!mind\b)\w+", re.I),
 )
 
+NOTE_INFERRED = (
+    re.compile(r"^i(?:'m| am) (?:a|an) \w+", re.I),
+    re.compile(r"^i (?:work|live|study) (?:as|at|in|on|for)\b", re.I),
+    re.compile(r"^i(?:'m| am) (?:working|building) (?:on|with)\b", re.I),
+    re.compile(r"^i (?:prefer|like|love|hate|dislike)\b", re.I),
+    re.compile(r"^i (?:always|usually|normally|mostly|mainly) \w+", re.I),
+    re.compile(r"^i (?:use|code in|program in|write in) \w+", re.I),
+)
+
+# Signs that an inferred sentence is about the problem in front of the user
+# rather than about the user: it points at something ("this", "it"), or it is
+# a complaint or a state of mind.
+NOTE_REJECT = re.compile(
+    r"\b(?:this|these|those|it|here|above|below|"
+    r"errors?|bugs?|issues?|problems?|exception|traceback|crash\w*|fail\w*|"
+    r"broken|wrong|confused|lost|stuck|sorry|unsure|trying|getting|seeing|"
+    r"bit|little)\b",
+    re.I,
+)
+
+# Notes that say who the user is. profile() keeps these ahead of newer ones.
+IDENTITY = re.compile(r"^(?:my name is|(?:you can |please )?call me)\b", re.I)
+
+# Openers stripped before matching, so "Also, I prefer tabs" and "Hi, my name
+# is Sam" are seen from where the statement starts.
+NOTE_LEAD = re.compile(
+    r"^(?:(?:hi|hello|hey|also|and|btw|by the way|oh|ok|okay|so|but|fyi|"
+    r"just so you know|note)\b[\s,:;!-]*)+",
+    re.I,
+)
+
+# Code is quoted, not said: a comment reading "# never call this twice" is not
+# the user stating a preference.
+CODE_BLOCK = re.compile(r"```.*?(?:```|\Z)|^(?: {4}|\t)[^\n]*", re.S | re.M)
+
 NOTE_MAX_CHARS = 200
+
+# At most this many notes are taken from one message; a message that yields
+# more is a document being pasted, not a user describing themselves.
+NOTES_PER_MESSAGE = 3
 
 
 # ============================================================
@@ -103,15 +127,20 @@ NOTE_MAX_CHARS = 200
 # ============================================================
 
 class _HashingEmbedder:
-    """Deterministic fallback used when sentence-transformers is unavailable.
+    """Deterministic fallback used when no trained encoder can be loaded.
 
     Hashes word and character 4-grams into a fixed vector. It is weaker than a
     trained encoder at matching paraphrases, but it needs no download and no
     model load, so memory still works on a machine that is offline the first
     time it runs.
+
+    The bucket comes from crc32, not hash(). Python salts str hashes per
+    process, so vectors written by one run landed in different buckets from
+    the queries of the next, and every restart silently turned recall into
+    noise. The name carries a version so indexes written that way are rebuilt.
     """
 
-    name = "hashing-512"
+    name = "hashing-512-v2"
     dim = 512
 
     _token = re.compile(r"[a-z0-9]+")
@@ -127,7 +156,7 @@ class _HashingEmbedder:
             grams += [lowered[i:i + 4] for i in range(len(lowered) - 3)]
 
             for gram in grams:
-                out[row, hash(gram) % self.dim] += 1.0
+                out[row, zlib.crc32(gram.encode("utf-8")) % self.dim] += 1.0
 
         return _normalize(out)
 
@@ -151,16 +180,189 @@ class _SentenceEmbedder:
         return np.asarray(vectors, dtype=np.float32)
 
 
+class _OnnxEmbedder:
+    """The sentence encoder run by onnxruntime instead of torch.
+
+    Same weights, same tokenizer, same pooling: the vectors agree with
+    sentence-transformers' to float rounding, so the two share a name and
+    with it the index on disk. What differs is the cost of having it loaded.
+    sentence-transformers imports torch and transformers to run a
+    22M-parameter model, which measured ~680 MB of RAM in this process; this
+    is a tokenizer and one inference session.
+    """
+
+    FILES = (
+        "onnx/model.onnx",
+        "tokenizer.json",
+        "1_Pooling/config.json",
+        "sentence_bert_config.json",
+    )
+
+    def __init__(self, root):
+        import onnxruntime
+        from tokenizers import Tokenizer
+
+        with open(os.path.join(root, "1_Pooling", "config.json"), encoding="utf-8") as handle:
+            pooling = json.load(handle)
+
+        if pooling.get("pooling_mode_mean_tokens"):
+            self._pool = "mean"
+        elif pooling.get("pooling_mode_cls_token"):
+            self._pool = "cls"
+        else:
+            raise ValueError("this encoder's pooling is not one the ONNX path implements")
+
+        with open(os.path.join(root, "sentence_bert_config.json"), encoding="utf-8") as handle:
+            max_length = int(json.load(handle).get("max_seq_length") or 512)
+
+        # The tokenizer file carries a fixed padding length for batch export;
+        # what the model was trained with is truncation at max_seq_length and
+        # padding to the longest text in the batch.
+        tokenizer = Tokenizer.from_file(os.path.join(root, "tokenizer.json"))
+        padding = tokenizer.padding or {}
+        tokenizer.enable_truncation(max_length=max_length)
+        tokenizer.enable_padding(
+            pad_id=padding.get("pad_id", 0),
+            pad_type_id=padding.get("pad_type_id", 0),
+            pad_token=padding.get("pad_token", "[PAD]"),
+        )
+        self._tokenizer = tokenizer
+
+        options = onnxruntime.SessionOptions()
+
+        # Six layers over one sentence: more threads than this add nothing.
+        options.intra_op_num_threads = min(4, os.cpu_count() or 1)
+        options.inter_op_num_threads = 1
+
+        # By default the pool's threads spin for a while after each run in
+        # case another follows. One follows per question, minutes apart; the
+        # spinning is only heat.
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+
+        # The arena keeps the largest batch it ever served. One long answer
+        # being indexed would hold that much for the life of the process;
+        # allocating per run costs microseconds on a model this size.
+        options.enable_cpu_mem_arena = False
+
+        self._session = onnxruntime.InferenceSession(
+            os.path.join(root, "onnx", "model.onnx"),
+            options,
+            providers=["CPUExecutionProvider"],
+        )
+        self._inputs = {node.name for node in self._session.get_inputs()}
+
+        self.name = EMBED_MODEL
+        self.dim = 0
+        self.dim = int(self.encode(["probe"]).shape[1])
+
+    def encode(self, texts):
+        texts = list(texts)
+
+        if not texts:
+            return np.zeros((0, self.dim), dtype=np.float32)
+
+        rows = []
+
+        for start in range(0, len(texts), 16):
+            batch = self._tokenizer.encode_batch(texts[start:start + 16])
+
+            ids = np.array([item.ids for item in batch], dtype=np.int64)
+            mask = np.array([item.attention_mask for item in batch], dtype=np.int64)
+
+            feed = {
+                "input_ids": ids,
+                "attention_mask": mask,
+                "token_type_ids": np.zeros_like(ids),
+            }
+
+            hidden = self._session.run(
+                None, {name: value for name, value in feed.items() if name in self._inputs}
+            )[0]
+
+            if hidden.ndim == 2:
+                # An export that pools inside the graph.
+                pooled = hidden
+            elif self._pool == "cls":
+                pooled = hidden[:, 0]
+            else:
+                weights = mask[:, :, None].astype(np.float32)
+                pooled = (hidden * weights).sum(axis=1) / np.maximum(weights.sum(axis=1), 1e-9)
+
+            rows.append(pooled)
+
+        return _normalize(np.concatenate(rows).astype(np.float32))
+
+
 def _normalize(matrix):
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     np.maximum(norms, 1e-12, out=norms)
     return matrix / norms
 
 
+def _encoder_files():
+    """Folder holding the encoder's ONNX export, fetching what is missing.
+
+    EMBED_MODEL is a Hugging Face repository, or a local folder laid out the
+    same way.
+    """
+
+    if os.path.isdir(EMBED_MODEL):
+        return EMBED_MODEL
+
+    root = os.path.join(EMBED_DIR, EMBED_MODEL.replace("/", "--"))
+
+    missing = [
+        name for name in _OnnxEmbedder.FILES
+        if not os.path.exists(os.path.join(root, *name.split("/")))
+    ]
+
+    # Small files first: a model with no ONNX export is found out on a few
+    # kilobytes, not after the weights.
+    for name in sorted(missing, key=lambda item: item.endswith(".onnx")):
+        path = os.path.join(root, *name.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        if name.endswith(".onnx"):
+            print("\n[memory: downloading the recall encoder (~90 MB, once)...]")
+
+        fetch.download_verified(fetch.hub_url(EMBED_MODEL, name), path)
+
+    return root
+
+
 def _build_embedder():
+    reason = None
+
+    if EMBED_RUNTIME in ("auto", "onnx"):
+        try:
+            return _OnnxEmbedder(_encoder_files())
+        except Exception as error:
+            # In auto this is also the ordinary road for an encoder that has
+            # no ONNX export: sentence-transformers is tried next, and the
+            # reason is only shown if that is not there either.
+            reason = "{}: {}".format(type(error).__name__, error)
+
+    if EMBED_RUNTIME == "onnx":
+        print("\n[memory: the ONNX encoder is unavailable ({}); using hashed "
+              "embeddings]".format(reason))
+
+        return _HashingEmbedder()
+
+    # Not just ImportError: a torchaudio left behind by an older torch fails
+    # to load its DLL with an OSError from inside the import, and that used to
+    # escape to _load and skip reading the history altogether.
     try:
         from sentence_transformers import SentenceTransformer
-    except ImportError:
+    except Exception as error:
+        if not isinstance(error, ImportError):
+            reason = "sentence-transformers failed to import: {}: {}".format(
+                type(error).__name__, error
+            )
+
+        if reason:
+            print("\n[memory: no encoder could be loaded ({}); using hashed "
+                  "embeddings]".format(reason))
+
         return _HashingEmbedder()
 
     try:
@@ -216,12 +418,22 @@ class Memory:
 
     def _load(self):
         try:
-            self._embedder = _build_embedder()
-            self._read_records()
-            self._read_vectors()
-        except Exception as error:  # never take the chat down with it
-            self._error = error
-            self._embedder = self._embedder or _HashingEmbedder()
+            try:
+                self._embedder = _build_embedder()
+            except Exception as error:  # never take the chat down with it
+                self._error = error
+                self._embedder = _HashingEmbedder()
+
+            try:
+                self._read_records()
+                self._read_vectors()
+            except Exception as error:
+                # The records on disk could not be read. Every write path
+                # rewrites the whole file from self.records, so carrying on
+                # would replace the user's history with this session's few
+                # rows. Nothing is written until the file can be read again.
+                self._error = error
+                self.enabled = False
         finally:
             self._loaded.set()
 
@@ -233,7 +445,9 @@ class Memory:
 
         records = []
 
-        with open(path, "r", encoding="utf-8") as handle:
+        # A stray non-UTF-8 byte fails the iterator, not json.loads, and so
+        # would lose every line rather than just its own.
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 line = line.strip()
 
@@ -403,17 +617,21 @@ class Memory:
 
         Pattern matching rather than a model call: this runs on every turn, and
         a second forward pass to classify the sentence would cost more than the
-        whole memory layer. Over-capture is cheap -- a wrong note is one line
-        that '/forget' removes -- while a missed one is invisible.
+        whole memory layer. A wrong note is not free, though -- it sits in the
+        system prompt of every later turn -- so the patterns lean towards
+        missing a statement, which '/remember' can add, over inventing one.
+        The caller shows what was captured, so a wrong note is seen and
+        '/forget' can remove it.
         """
 
         if not self.enabled or not self._loaded.is_set():
             return []
 
         captured = []
+        prose = CODE_BLOCK.sub(" ", user_message)
 
-        for sentence in re.split(r"(?<=[.!?\n])\s+", user_message):
-            sentence = sentence.strip()
+        for sentence in re.split(r"(?<=[.!?\n])\s+", prose):
+            sentence = NOTE_LEAD.sub("", sentence.strip())
 
             if not 8 <= len(sentence) <= NOTE_MAX_CHARS:
                 continue
@@ -423,14 +641,21 @@ class Memory:
             if sentence.rstrip().endswith("?"):
                 continue
 
-            for pattern in NOTE_PATTERNS:
-                if pattern.search(sentence):
-                    record = self.note(sentence)
+            if any(pattern.search(sentence) for pattern in NOTE_EXPLICIT):
+                text = _note_text(sentence)
+            elif (any(pattern.search(sentence) for pattern in NOTE_INFERRED)
+                    and not NOTE_REJECT.search(sentence)):
+                text = sentence
+            else:
+                continue
 
-                    if record is not None:
-                        captured.append(record)
+            record = self.note(text)
 
-                    break
+            if record is not None:
+                captured.append(record)
+
+            if len(captured) >= NOTES_PER_MESSAGE:
+                break
 
         return captured
 
@@ -485,11 +710,14 @@ class Memory:
     # -- reading ----------------------------------------------
 
     def recall(self, query, keep=RECALL_KEEP):
-        """Return the memories worth putting in front of the model.
+        """Return the past exchanges worth putting in front of the model.
 
         Ranked by cosine similarity, nudged by rating. Records the user marked
         bad are excluded outright: the point of a thumbs-down is that the model
         should stop seeing that answer, not see it ranked slightly lower.
+
+        Notes are not recalled here; they reach the model through profile(),
+        on every turn, and showing one twice only makes it louder.
         """
 
         if not self.enabled or not query:
@@ -510,14 +738,12 @@ class Memory:
                 index = int(index)
                 record = self.records[index]
 
-                if record.get("score", 0) < 0:
+                if record.get("score", 0) < 0 or record.get("kind") == "note":
                     continue
 
-                kind = record.get("kind")
-                floor = NOTE_THRESHOLD if kind == "note" else RECALL_THRESHOLD
                 similarity = float(scores[index])
 
-                if similarity < floor:
+                if similarity < RECALL_THRESHOLD:
                     continue
 
                 boost = SCORE_WEIGHT * max(
@@ -537,50 +763,78 @@ class Memory:
             return [(similarity, record) for _, similarity, _, record in hits]
 
     def block(self, hits):
-        """Render recalled memories as a prompt section, or None if empty."""
+        """Render recalled exchanges as a prompt section, or None if empty.
+
+        Each one carries the date it happened, so the model can tell an answer
+        from last week from one it gave a year ago.
+        """
 
         if not hits:
             return None
 
-        notes = []
-        exchanges = []
-
+        entries = []
         used = 0
 
         for _, record in hits:
-            if record.get("kind") == "note":
-                entry = "- {}".format(_clip(record["a"], NOTE_MAX_CHARS))
-                bucket = notes
-            else:
-                entry = "- Asked before: {}\n  You answered: {}".format(
-                    _clip(record["q"], 200),
-                    _clip(record["a"], ANSWER_CHAR_BUDGET),
-                )
-                bucket = exchanges
+            entry = "- On {}, asked: {}\n  You answered: {}".format(
+                (record.get("ts") or "")[:10] or "an earlier day",
+                _clip(record["q"], 200),
+                _clip(_prose(record["a"]), ANSWER_CHAR_BUDGET),
+            )
 
             if used + len(entry) > RECALL_CHAR_BUDGET:
                 break
 
-            bucket.append(entry)
+            entries.append(entry)
             used += len(entry)
 
-        if not notes and not exchanges:
+        if not entries:
             return None
 
-        lines = []
+        return "\n".join(["Earlier exchanges with this user:"] + entries)
 
-        if notes:
-            lines.append("What you know about this user:")
-            lines.extend(notes)
+    def profile(self):
+        """The notes to state in the system prompt, oldest first.
 
-        if exchanges:
-            if lines:
-                lines.append("")
+        The most recent PROFILE_MAX_NOTES that fit PROFILE_CHAR_BUDGET, minus
+        any the user rated down -- except that who the user is outranks what
+        they said last: a name pushed out by eight newer preferences is the
+        note most missed. Returned in a stable order, because this text heads
+        the prompt and any change to it costs the whole KV cache.
+        """
 
-            lines.append("Relevant earlier turns in this ongoing relationship:")
-            lines.extend(exchanges)
+        if not self.enabled or not self._loaded.is_set():
+            return []
 
-        return "\n".join(lines)
+        with self._lock:
+            notes = [
+                record for record in self.records
+                if record.get("kind") == "note" and record.get("score", 0) >= 0
+            ]
+
+        def when(record):
+            return (record.get("ts", ""), record.get("id", 0))
+
+        notes.sort(key=when)
+
+        identity = [record for record in notes if IDENTITY.match(record.get("a", ""))]
+        others = [record for record in notes if not IDENTITY.match(record.get("a", ""))]
+
+        chosen = []
+        used = 0
+
+        for record in identity[::-1] + others[::-1]:
+            size = len(_clip(record.get("a", ""), NOTE_MAX_CHARS))
+
+            if len(chosen) >= PROFILE_MAX_NOTES or used + size > PROFILE_CHAR_BUDGET:
+                break
+
+            chosen.append(record)
+            used += size
+
+        chosen.sort(key=when)
+
+        return [_clip(record.get("a", ""), NOTE_MAX_CHARS) for record in chosen]
 
     # -- feedback ---------------------------------------------
 
@@ -708,6 +962,29 @@ def _clip(text, limit):
     return text if len(text) <= limit else text[:limit].rstrip() + " ..."
 
 
+def _prose(answer):
+    """An answer with its code blocks elided, for recall.
+
+    _clip collapses whitespace, which turns a code block into one long line
+    of broken syntax -- and a 7B shown broken code imitates it. The prose
+    around the code is what records what was said.
+    """
+
+    return CODE_BLOCK.sub(" [code omitted] ", answer)
+
+
+def _note_text(sentence):
+    """An explicit statement as the fact it states.
+
+    "Remember that I work nights." is stored as "I work nights."; the command
+    wrapped around the fact means nothing once it is in the profile.
+    """
+
+    text = re.sub(r"^(?:please )?remember(?: that|:)?\s+", "", sentence, flags=re.I)
+
+    return text[:1].upper() + text[1:] if text else sentence
+
+
 def _join(question, answer, kind):
     """Text an exchange is indexed by.
 
@@ -747,8 +1024,8 @@ def ground(user_message, memory_block, web_context=None):
         ">>>\n"
         "END MEMORY\n\n"
         "Use the MEMORY when it is relevant: stay consistent with what you "
-        "already told this user and with their stated preferences. If it is "
-        "not relevant to the question, ignore it silently -- never mention "
-        "having a memory, and never answer a question the user did not ask.\n\n"
+        "already told this user, and correct it if it was wrong. If it is not "
+        "relevant to the question, ignore it silently -- never mention having "
+        "a memory, and never answer a question the user did not ask.\n\n"
         "{}"
     ).format(memory_block, user_message)

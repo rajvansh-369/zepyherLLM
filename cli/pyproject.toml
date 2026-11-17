@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zypher-cli"
+description = "zypherLL in the terminal: a coding agent that talks to the zypherLL HTTP API."
+readme = "README.md"
+requires-python = ">=3.9"
+dynamic = ["version"]
+dependencies = [
+    # The API client. 0.23 is where the stream() context manager settled.
+    "httpx>=0.23,<1",
+    # Markdown, diffs and the live answer.
+    "rich>=13,<15",
+    # The input line: history, completion, key bindings.
+    "prompt_toolkit>=3.0.36,<4",
+]
+
+[project.scripts]
+zy = "zypher_cli.app:main"
+
+[tool.setuptools]
+packages = ["zypher_cli"]
+
+[tool.setuptools.dynamic]
+version = { attr = "zypher_cli.__version__" }
