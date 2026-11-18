@@ -123,6 +123,67 @@ NOTES_PER_MESSAGE = 3
 
 
 # ============================================================
+# ABOUT ME
+# ============================================================
+
+# What the user wrote about themselves in the settings, field by field, with
+# the most characters each may hold. It heads the system prompt on every turn,
+# so the caps are what keeps it from crowding out the conversation.
+ABOUT_FILE = "about.json"
+ABOUT_FIELDS = {
+    "name": 60,
+    "role": 120,
+    "about": 600,
+    "style": 600,
+}
+
+
+# ============================================================
+# WHAT IS WORTH REMEMBERING
+# ============================================================
+
+# Small talk. Recalled later it only adds noise: "hii" resembles every other
+# greeting, and the old reply teaches the model nothing.
+SMALL_TALK = re.compile(
+    r"^\W*(?:h+i+|hey+|hello+|yo|thanks?(?: you)?|thx|ty|ok(?:ay)?|cool|nice|"
+    r"great|bye|good (?:morning|night|evening|afternoon)|who are you|"
+    r"what(?:'s| is) your name|how are you)\W*$",
+    re.I,
+)
+
+# Questions about the conversation itself. The answer is only true inside the
+# chat it was given in: recalled into another, "your previous request was X"
+# is simply wrong.
+CONVERSATIONAL = re.compile(
+    r"\b(?:what (?:did|have) (?:i|we|you) (?:just )?(?:ask|say|said|tell|told|write|wrote|talk)\w*|"
+    r"you (?:just )?(?:said|told|wrote|mentioned)|"
+    r"(?:my|your|the) (?:last|previous|earlier|first) (?:question|message|answer|reply|request)|"
+    r"(?:above|earlier) in (?:this|our|the) (?:chat|conversation))\b",
+    re.I,
+)
+
+# Fewer words than this and a question is a fragment ("and python?") whose
+# meaning lives in the turn before it -- stored alone it would be recalled for
+# the wrong things.
+MIN_QUESTION_WORDS = 3
+MIN_ANSWER_CHARS = 40
+
+
+def worth_remembering(question, answer):
+    """Whether an exchange carries anything a later conversation can use."""
+
+    question = (question or "").strip()
+
+    if len(question.split()) < MIN_QUESTION_WORDS and "```" not in question:
+        return False
+
+    if SMALL_TALK.match(question) or CONVERSATIONAL.search(question):
+        return False
+
+    return len((answer or "").strip()) >= MIN_ANSWER_CHARS
+
+
+# ============================================================
 # EMBEDDING
 # ============================================================
 
@@ -561,6 +622,9 @@ class Memory:
         if not self._loaded.is_set():
             return None
 
+        if kind == "exchange" and not worth_remembering(question, answer):
+            return None
+
         with self._lock:
             vector = self._embedder.encode([_join(question, answer, kind)])[0]
 
@@ -709,7 +773,7 @@ class Memory:
 
     # -- reading ----------------------------------------------
 
-    def recall(self, query, keep=RECALL_KEEP):
+    def recall(self, query, keep=RECALL_KEEP, visible=()):
         """Return the past exchanges worth putting in front of the model.
 
         Ranked by cosine similarity, nudged by rating. Records the user marked
@@ -718,7 +782,14 @@ class Memory:
 
         Notes are not recalled here; they reach the model through profile(),
         on every turn, and showing one twice only makes it louder.
+
+        visible: questions already in the conversation being answered. An
+        exchange asking one of them is on screen in full, so recalling its
+        clipped copy only spends the budget twice. Records stored before
+        worth_remembering existed are filtered by it here as well.
         """
+
+        shown = {_question_key(text) for text in visible}
 
         if not self.enabled or not query:
             return []
@@ -739,6 +810,12 @@ class Memory:
                 record = self.records[index]
 
                 if record.get("score", 0) < 0 or record.get("kind") == "note":
+                    continue
+
+                if _question_key(record.get("q", "")) in shown:
+                    continue
+
+                if not worth_remembering(record.get("q"), record.get("a")):
                     continue
 
                 similarity = float(scores[index])
@@ -836,6 +913,48 @@ class Memory:
 
         return [_clip(record.get("a", ""), NOTE_MAX_CHARS) for record in chosen]
 
+    # -- about me ---------------------------------------------
+
+    def about(self):
+        """What the user wrote about themselves: every field, '' when unset."""
+
+        try:
+            with open(self._path(ABOUT_FILE), encoding="utf-8") as handle:
+                stored = json.load(handle)
+        except (OSError, ValueError):
+            stored = {}
+
+        if not isinstance(stored, dict):
+            stored = {}
+
+        return {
+            field: str(stored.get(field) or "").strip()[:limit]
+            for field, limit in ABOUT_FIELDS.items()
+        }
+
+    def set_about(self, fields):
+        """Replace the given fields (others are kept). Returns the result.
+
+        Written to a temporary file and renamed into place, so a crash halfway
+        leaves the previous version rather than half of this one.
+        """
+
+        with self._lock:
+            current = self.about()
+
+            for field, limit in ABOUT_FIELDS.items():
+                if fields.get(field) is not None:
+                    current[field] = str(fields[field]).strip()[:limit]
+
+            path = self._path(ABOUT_FILE)
+
+            with open(path + ".tmp", "w", encoding="utf-8") as handle:
+                json.dump(current, handle, ensure_ascii=False, indent=2)
+
+            os.replace(path + ".tmp", path)
+
+        return self.about()
+
     # -- feedback ---------------------------------------------
 
     def rate(self, delta, target=None):
@@ -874,6 +993,11 @@ class Memory:
 
         with self._lock:
             if selector == "all":
+                try:
+                    os.remove(self._path(ABOUT_FILE))
+                except OSError:
+                    pass
+
                 removed = len(self.records)
                 self.records = []
                 self.vectors = np.zeros((0, self._embedder.dim), dtype=np.float32)

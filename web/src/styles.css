@@ -2132,6 +2132,94 @@ dialog.sheet::backdrop {
   height: 40px;
 }
 
+/* -- About me ---------------------------------------------------- */
+
+.about-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.about-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.6fr;
+  gap: 12px;
+}
+
+@media (max-width: 560px) {
+  .about-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.about-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.about-field label {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--text-2);
+}
+
+.about-field .field {
+  flex: none;
+}
+
+.field.area {
+  height: auto;
+  min-height: 76px;
+  padding: 10px 12px;
+  line-height: 1.5;
+  resize: vertical;
+  font-family: inherit;
+}
+
+.presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: -6px;
+}
+
+.preset {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast) ease-out,
+    color var(--dur-fast) ease-out,
+    background var(--dur-fast) ease-out;
+}
+
+.preset:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.preset[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.about-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .records {
   margin: 8px 0 0;
   padding: 0;

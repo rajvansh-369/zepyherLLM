@@ -2,6 +2,7 @@
 // forwards it to the API and adds the key (see vite.config.ts).
 
 import type {
+  About,
   Health,
   MemoryRecord,
   MemoryStats,
@@ -78,7 +79,12 @@ export const getRecords = (kind?: "note" | "exchange", limit = 200) =>
 export const addNote = (text: string) =>
   request<MemoryRecord>("/v1/memory/notes", { method: "POST", body: JSON.stringify({ text }) });
 
-export const rate = (id: number, rating: "good" | "bad") =>
+export const getAbout = () => request<About>("/v1/memory/about");
+
+export const saveAbout = (about: Partial<About>) =>
+  request<About>("/v1/memory/about", { method: "PUT", body: JSON.stringify(about) });
+
+export const rate =(id: number, rating: "good" | "bad") =>
   request<MemoryRecord>(`/v1/memory/${id}/rate`, {
     method: "POST",
     body: JSON.stringify({ rating }),

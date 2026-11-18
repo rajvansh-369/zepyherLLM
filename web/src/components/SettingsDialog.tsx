@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { CircleAlert, CircleCheck, Cpu, History, Trash2, UserRound, X } from "lucide-react";
+import { CircleAlert, CircleCheck, Cpu, History, IdCard, Trash2, UserRound, X } from "lucide-react";
 import * as api from "../api";
-import type { Health, MemoryRecord, MemoryStats, Settings } from "../types";
+import type { About, Health, MemoryRecord, MemoryStats, Settings } from "../types";
 
-export type SettingsTab = "notes" | "exchanges" | "server";
+export type SettingsTab = "about" | "notes" | "exchanges" | "server";
 
 interface Props {
   initialTab: SettingsTab;
@@ -13,7 +13,8 @@ interface Props {
 }
 
 const TABS = [
-  { id: "notes", label: "About you", icon: UserRound },
+  { id: "about", label: "About me", icon: IdCard },
+  { id: "notes", label: "Notes", icon: UserRound },
   { id: "exchanges", label: "Remembered answers", icon: History },
   { id: "server", label: "Engine", icon: Cpu },
 ] as const;
@@ -43,7 +44,7 @@ export function SettingsDialog({ initialTab, health, offline, onClose }: Props) 
     try {
       const [overview, list, current] = await Promise.all([
         api.getMemory(),
-        tab === "server"
+        tab === "server" || tab === "about"
           ? Promise.resolve(null)
           : api.getRecords(tab === "notes" ? "note" : "exchange"),
         api.getSettings(),
@@ -138,11 +139,13 @@ export function SettingsDialog({ initialTab, health, offline, onClose }: Props) 
           </div>
         )}
 
+        {tab === "about" && <AboutForm onSaved={() => setInfo("Saved. Every new answer uses it.")} />}
+
         {tab === "notes" && (
           <>
             <p className="muted">
-              Facts about you. The most recent ones go into every conversation. They are also
-              picked up automatically when you say things like “I prefer tabs”.
+              Smaller facts, picked up automatically when you say things like “I prefer tabs”, or
+              added here. The most recent ones go into every conversation.
             </p>
             <form
               className="field-row"
@@ -294,6 +297,185 @@ export function SettingsDialog({ initialTab, health, offline, onClose }: Props) 
         )}
       </footer>
     </dialog>
+  );
+}
+
+// Same caps as the API (zypher/model/memory.py ABOUT_FIELDS).
+const ABOUT_LIMITS: Record<keyof About, number> = { name: 60, role: 120, about: 600, style: 600 };
+
+// One click adds a common instruction to the response style.
+const STYLE_PRESETS = [
+  ["Concise", "Keep answers short and to the point."],
+  ["Step by step", "Break complex problems into numbered steps and explain the reasoning."],
+  ["Code first", "Lead with working code, then explain it."],
+  ["Beginner friendly", "Explain terms simply and avoid unexplained jargon."],
+] as const;
+
+const EMPTY_ABOUT: About = { name: "", role: "", about: "", style: "" };
+
+function AboutForm({ onSaved }: { onSaved: () => void }) {
+  const [saved, setSaved] = useState<About | null>(null);
+  const [draft, setDraft] = useState<About>(EMPTY_ABOUT);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .getAbout()
+      .then((about) => {
+        setSaved(about);
+        setDraft(about);
+      })
+      .catch((e) => {
+        setSaved(EMPTY_ABOUT);
+        setError((e as Error).message);
+      });
+  }, []);
+
+  if (saved === null) return <Skeleton rows={4} />;
+
+  const dirty = (Object.keys(draft) as (keyof About)[]).some((k) => draft[k] !== saved[k]);
+  const set = (field: keyof About) => (value: string) => setDraft((d) => ({ ...d, [field]: value }));
+
+  const addPreset = (sentence: string) => {
+    if (draft.style.includes(sentence)) return;
+    const next = (draft.style.trim() + " " + sentence).trim();
+    if (next.length <= ABOUT_LIMITS.style) set("style")(next);
+  };
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+
+    try {
+      const about = await api.saveAbout(draft);
+      setSaved(about);
+      setDraft(about);
+      onSaved();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form className="about-form" onSubmit={submit}>
+      <p className="muted">
+        Tell the model who you are and how you like answers. This goes into every conversation, so
+        answers match your level and style from the first message.
+      </p>
+      {error && (
+        <div className="note bad" role="alert">
+          <CircleAlert size={16} />
+          <div>{error}</div>
+        </div>
+      )}
+
+      <div className="about-grid">
+        <Field label="Name" field="name" value={draft.name} onChange={set("name")} placeholder="e.g. Sam" />
+        <Field
+          label="What you do"
+          field="role"
+          value={draft.role}
+          onChange={set("role")}
+          placeholder="e.g. Backend developer, 5 years of PHP"
+        />
+      </div>
+      <Field
+        label="About you"
+        field="about"
+        multiline
+        value={draft.about}
+        onChange={set("about")}
+        placeholder="Your stack, current projects, what you are learning, what you already know well…"
+      />
+      <Field
+        label="How should answers be written?"
+        field="style"
+        multiline
+        value={draft.style}
+        onChange={set("style")}
+        placeholder="e.g. Explain the why before the how. Use TypeScript in examples."
+      />
+      <div className="presets" aria-label="Add a common instruction">
+        {STYLE_PRESETS.map(([label, sentence]) => (
+          <button
+            type="button"
+            key={label}
+            className="preset"
+            aria-pressed={draft.style.includes(sentence)}
+            onClick={() => addPreset(sentence)}
+          >
+            + {label}
+          </button>
+        ))}
+      </div>
+
+      <div className="about-actions">
+        {dirty && (
+          <button type="button" className="btn ghost sm" onClick={() => setDraft(saved)}>
+            Discard
+          </button>
+        )}
+        <button className="btn primary" disabled={!dirty || busy}>
+          {busy ? "Saving…" : "Save"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function Field({
+  label,
+  field,
+  value,
+  onChange,
+  placeholder,
+  multiline,
+}: {
+  label: string;
+  field: keyof About;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+  multiline?: boolean;
+}) {
+  const limit = ABOUT_LIMITS[field];
+  const id = `about-${field}`;
+
+  return (
+    <div className="about-field">
+      <label htmlFor={id}>
+        <span>{label}</span>
+        {value.length > limit * 0.8 && (
+          <small className="muted">
+            {value.length}/{limit}
+          </small>
+        )}
+      </label>
+      {multiline ? (
+        <textarea
+          id={id}
+          className="field area"
+          rows={3}
+          maxLength={limit}
+          value={value}
+          placeholder={placeholder}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      ) : (
+        <input
+          id={id}
+          className="field"
+          maxLength={limit}
+          value={value}
+          placeholder={placeholder}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      )}
+    </div>
   );
 }
 

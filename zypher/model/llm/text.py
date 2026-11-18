@@ -22,7 +22,7 @@ class PromptTooLong(ValueError):
     """One message is larger than the context window can hold."""
 
 
-def system_prompt(notes=()):
+def system_prompt(notes=(), about=None):
     """SYSTEM_PROMPT plus today's date and what is known about the user.
 
     The date is stated on every turn, not only on the ones that searched the
@@ -33,6 +33,10 @@ def system_prompt(notes=()):
     every question, including the many it does not resemble, and text at the
     head of the prompt stays in the KV cache instead of being read again on
     each turn. Its wording must therefore stay stable from turn to turn.
+
+    about: what the user wrote about themselves in the settings -- name,
+    role, about, style. It comes before the notes: the user chose to say it,
+    where a note was only picked up from something they said in passing.
     """
 
     parts = [
@@ -40,6 +44,30 @@ def system_prompt(notes=()):
         "",
         "Today's date is {}.".format(datetime.date.today().strftime("%d %B %Y")),
     ]
+
+    about = about or {}
+    facts = [
+        ("Name", about.get("name")),
+        ("Role", about.get("role")),
+        ("Background", about.get("about")),
+    ]
+    facts = [(label, " ".join(value.split())) for label, value in facts if value]
+
+    if facts:
+        parts.append("")
+        parts.append(
+            "The user describes themselves as follows. Tailor examples, depth "
+            "and vocabulary to it, but do not repeat it back to them:"
+        )
+        parts.extend("- {}: {}".format(label, value) for label, value in facts)
+
+    if about.get("style"):
+        parts.append("")
+        parts.append(
+            "How the user wants you to respond. Follow it on every answer "
+            "unless a message asks for something else:"
+        )
+        parts.append(about["style"].strip())
 
     if notes:
         parts.append("")

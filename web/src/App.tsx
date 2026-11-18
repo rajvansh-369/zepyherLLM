@@ -554,7 +554,7 @@ export default function App() {
         onDelete={remove}
         onClose={() => showSidebar(false)}
         onTheme={setTheme}
-        onSettings={() => setSettings("notes")}
+        onSettings={() => setSettings("about")}
       />
 
       <main className={"main" + (empty ? " is-empty" : "")}>

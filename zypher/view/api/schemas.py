@@ -5,7 +5,7 @@ from typing import List, Literal, Optional, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 from zypher import config
-from zypher.model.memory import NOTE_MAX_CHARS
+from zypher.model.memory import ABOUT_FIELDS, NOTE_MAX_CHARS
 
 
 class TextPart(BaseModel):
@@ -54,6 +54,15 @@ class ChatRequest(BaseModel):
 
 class NoteRequest(BaseModel):
     text: str = Field(min_length=1, max_length=NOTE_MAX_CHARS)
+
+
+class AboutRequest(BaseModel):
+    """What the user says about themselves. A field left out is unchanged."""
+
+    name: Optional[str] = Field(default=None, max_length=ABOUT_FIELDS["name"])
+    role: Optional[str] = Field(default=None, max_length=ABOUT_FIELDS["role"])
+    about: Optional[str] = Field(default=None, max_length=ABOUT_FIELDS["about"])
+    style: Optional[str] = Field(default=None, max_length=ABOUT_FIELDS["style"])
 
 
 class RateRequest(BaseModel):

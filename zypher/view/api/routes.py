@@ -7,6 +7,8 @@ Endpoints. Each one translates HTTP to an Assistant call and back.
     GET    /v1/memory                   stats and the notes in the system prompt
     GET    /v1/memory/records           stored records, newest first
     POST   /v1/memory/notes             keep a fact about the user
+    GET    /v1/memory/about             what the user wrote about themselves
+    PUT    /v1/memory/about             change it
     POST   /v1/memory/{id}/rate         good / bad
     DELETE /v1/memory                   forget last | all | <text>
     GET    /v1/settings                 server-wide defaults
@@ -29,7 +31,7 @@ from zypher.model import retrieval
 from zypher.model.llm import ClientGone, OutOfMemory
 from zypher.presenter import ModelNotReady
 
-from .schemas import ChatRequest, NoteRequest, RateRequest, SettingsRequest
+from .schemas import AboutRequest, ChatRequest, NoteRequest, RateRequest, SettingsRequest
 
 OOM_MESSAGE = "out of GPU memory -- send less history or lower max_tokens"
 
@@ -300,6 +302,16 @@ def memory_note(body: NoteRequest, assistant=Depends(assistant_of)):
         raise HTTPException(503, "memory is off or unavailable")
 
     return record
+
+
+@router.get("/v1/memory/about")
+def memory_about(assistant=Depends(assistant_of)):
+    return memory_call(assistant.about)
+
+
+@router.put("/v1/memory/about")
+def memory_set_about(body: AboutRequest, assistant=Depends(assistant_of)):
+    return memory_call(assistant.set_about, body.model_dump())
 
 
 @router.post("/v1/memory/{record_id}/rate")

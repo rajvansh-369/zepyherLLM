@@ -17,6 +17,7 @@ Left there, it would re-spend a large part of the prompt budget on every later
 turn re-showing text the model has already used.
 """
 
+import re
 import threading
 
 from zypher import config
@@ -159,6 +160,7 @@ class Assistant:
         sources = []
         recalled = 0
         notes = ()
+        about = None
 
         if continuing:
             # The same sources as the answer being continued, if it is the
@@ -181,18 +183,20 @@ class Assistant:
             store.ready(15)
 
             if not continuing:
-                hits = store.recall(question)
+                earlier = [m["content"] for m in history[:-1] if m["role"] == "user"]
+                hits = store.recall(_recall_query(question, earlier), visible=earlier)
                 recalled = len(hits)
                 grounded = memory_store.ground(grounded, store.block(hits))
 
             notes = store.profile()
+            about = store.about()
 
         if recalled:
             event("status", {"stage": "recalled", "count": recalled})
 
         # Rebuilt every turn, for the date and for notes captured since. The
         # same text as last turn keeps the whole KV cache.
-        system = llm.system_prompt(notes)
+        system = llm.system_prompt(notes, about)
 
         if system_extra:
             system += "\n\n" + system_extra
@@ -342,6 +346,12 @@ class Assistant:
             if kind is None or record.get("kind", "exchange") == kind
         ]
 
+    def about(self):
+        return self._memory().about()
+
+    def set_about(self, fields):
+        return self._memory().set_about(fields)
+
     def note(self, text):
         """Keep a fact about the user. Returns the record, or None."""
 
@@ -376,6 +386,31 @@ def _split_system(messages):
     history = [m for m in messages if m["role"] != "system"]
 
     return system, history
+
+
+# Openers that make a message a follow-up: its subject is in the turn before.
+FOLLOW_UP = re.compile(
+    r"^(?:and|but|also|so|then|what about|how about|why|why not|it|that|this|"
+    r"those|these|same|ok|okay|now|more|another|instead)\b",
+    re.I,
+)
+
+
+def _recall_query(question, earlier):
+    """What to search memory with for this question.
+
+    A follow-up -- "and how do I test it?" -- names nothing. Searched alone it
+    matches whatever else is about testing, or nothing, so a short or
+    referring question is searched together with the question before it.
+    """
+
+    if not earlier:
+        return question
+
+    if len(question.split()) >= 12 and not FOLLOW_UP.match(question.strip()):
+        return question
+
+    return "{}\n{}".format(earlier[-1][-600:], question)
 
 
 def _cited(sources, answer):

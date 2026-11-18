@@ -90,6 +90,14 @@ export interface MemoryStats {
   error: string | null;
 }
 
+/** What the user wrote about themselves. Every field is "" when unset. */
+export interface About {
+  name: string;
+  role: string;
+  about: string;
+  style: string;
+}
+
 export interface MemoryRecord {
   id: number;
   ts: string;
