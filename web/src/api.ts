@@ -106,8 +106,10 @@ export interface ChatOptions {
 
 /** Progress the API reports before and during an answer. */
 export interface Status {
-  stage: "searching" | "recalled" | "waking" | string;
+  stage: "searching" | "recalled" | "waking" | "switching" | string;
   count?: number;
+  /** With "switching": the model being loaded. */
+  model?: string;
 }
 
 export interface ChatResult {

@@ -204,10 +204,11 @@ class Assistant:
         max_tokens: answer budget, capped at config.MAX_TOTAL_NEW_TOKENS.
         min_tokens: no end of turn before this many tokens, capped at the
             answer budget.
-        model: a slot ("general", "code") or model id this request needs.
-            If it is not the one loaded, it is loaded first -- the zy CLI
-            asks for "code". Anything else (None, "auto", an unknown name)
-            answers with the model loaded now.
+        model: a slot ("general", "code") or model id this request needs
+            -- the zy CLI asks for "code". Anything else (None, "auto", an
+            unknown name) means the model chosen in the settings, so the
+            web chat stays on that choice even after zy borrowed the GPU.
+            Whichever it is, it is loaded first if it is not on the GPU.
         on_event(kind, payload): "status" with a dict before generation
             ({"stage": "searching"}, {"stage": "recalled", "count": n}, or
             {"stage": "waking"} when the model has to be loaded back in),
@@ -318,9 +319,9 @@ class Assistant:
         # answer, so such exchanges are never stored.
         live = bool(context) or web is True or retrieval.needs_live_data(question)
 
-        wanted = self._slot_named(model)
+        wanted = self._slot_named(model) or config.selected_model()
 
-        if wanted is not None and wanted != self.active:
+        if wanted in self.engines and wanted != self.active:
             event("status", {"stage": "switching", "model": config.model_slots()[wanted]["id"]})
             # Not saved: the choice in the settings stays what loads at start.
             self.switch(wanted, save=False)

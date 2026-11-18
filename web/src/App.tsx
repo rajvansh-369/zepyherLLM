@@ -79,6 +79,8 @@ function describe(status: Status): StatusInfo | null {
       };
     case "waking":
       return { stage: status.stage, text: "Loading the model back in…" };
+    case "switching":
+      return { stage: status.stage, text: `Loading ${status.model ?? "your model"}…` };
     default:
       return null;
   }

@@ -37,9 +37,9 @@ class ChatRequest(BaseModel):
     # an existing client does not have to be trimmed down to talk to this.
     model_config = ConfigDict(extra="ignore")
 
-    # Left out, or a name not served here: the model loaded now answers.
-    # "general" / "code" or a model id: that model, loaded first if needed
-    # (the zy CLI sends "code").
+    # "general" / "code" or a model id: that model (the zy CLI sends
+    # "code"). Left out, or a name not served here: the model chosen in the
+    # settings. Either is loaded first if another is on the GPU.
     model: Optional[str] = None
     messages: List[Message] = Field(min_length=1)
     stream: bool = False
