@@ -20,10 +20,19 @@ import time
 
 from . import protocol
 from .api import ApiError, Offline
-from .tools import IGNORED_DIRS, Result, ToolError, diff_stats, merge_loose
+from .tools import IGNORED_DIRS, AlreadyDone, Result, ToolError, diff_stats, merge_loose
 
 MAX_STEPS = 25
 MAX_FAILURES = 4
+
+# Failed changes to one file in one request before giving up on it. Counted
+# across the whole request, not in a row: a model alternating a failed edit
+# with a successful read never fails MAX_FAILURES times running, and looped
+# until the context window was trimmed and it started over.
+MAX_FILE_MISSES = 4
+
+# The same call this many times in one request, anywhere in it, is a loop.
+MAX_SAME_CALL = 3
 MAX_CONTINUES = 3
 RUN_TIMEOUT = 120
 
@@ -332,6 +341,8 @@ class Agent:
         failures = 0
         previous = None
         repeats = 0
+        made = {}      # rendered call -> times made in this request
+        misses = {}    # file -> failed changes to it in this request
         produced = 0
         started = time.monotonic()
         finished = False
@@ -405,11 +416,17 @@ class Agent:
 
             if call.name in ("write", "edit", "replace"):
                 tried += 1
+                target = call.path or ""
 
                 if result.ok and result.summary not in ("no change", "not written", "failed"):
                     changed += 1
+                    misses.pop(target, None)
+                elif getattr(result, "failed", False):
+                    misses[target] = misses.get(target, 0) + 1
 
-            if rendered == previous:
+            made[rendered] = made.get(rendered, 0) + 1
+
+            if rendered == previous or made[rendered] > 1:
                 # The most likely continuation led here once and will again:
                 # say so briefly, without the same long result a second
                 # time, and let the next reply be sampled more freely.
@@ -435,7 +452,13 @@ class Agent:
                 ui.warn("Stopped: {} tool calls in a row failed.".format(failures))
                 stop = "(stopped after repeated failed tool calls)"
                 gave_up = True
-            elif stop is None and repeats >= 3:
+            elif stop is None and max(misses.values(), default=0) >= MAX_FILE_MISSES:
+                stuck = max(misses, key=misses.get)
+                ui.warn("Stopped: {} changes to {} failed. If the change is already "
+                        "there, nothing more is needed.".format(misses[stuck], stuck))
+                stop = "(stopped: changes to {} kept failing)".format(stuck)
+                gave_up = True
+            elif stop is None and (repeats >= 3 or made[rendered] >= MAX_SAME_CALL):
                 ui.warn("Stopped: the model kept repeating the same call.")
                 stop = "(stopped: repeating the same call)"
                 gave_up = True
@@ -818,6 +841,15 @@ class Agent:
 
         try:
             old, new = ws.plan_edit(path, call.blocks())
+        except AlreadyDone as done:
+            ui.outcome("already applied")
+            self.seen.add(self._key(path))
+
+            return Result(
+                "{} already has this change ({}). The edit is done. If that was "
+                "the last change, give the final answer now.".format(shown, done),
+                "already applied",
+            )
         except ToolError as error:
             ui.outcome(str(error).split("\n")[0][:140], ok=False)
 

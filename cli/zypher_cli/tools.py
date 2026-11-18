@@ -156,6 +156,11 @@ class ToolError(Exception):
     """A tool call that could not be carried out. The text goes to the model."""
 
 
+class AlreadyDone(ToolError):
+    """An edit whose every change is already in the file. Not a failure: the
+    work is done, and the model must be told so rather than told to retry."""
+
+
 class Result:
 
     def __init__(self, body, summary, ok=True):
@@ -283,6 +288,21 @@ def _kill_tree(process):
 
 def _indent(line):
     return line[:len(line) - len(line.lstrip())]
+
+
+def has_lines(text, snippet):
+    """Whether snippet's non-blank lines appear in text, in a row, ignoring
+    indentation and trailing spaces. False for a blank snippet."""
+
+    wanted = [line.strip() for line in snippet.split("\n") if line.strip()]
+
+    if not wanted:
+        return False
+
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    size = len(wanted)
+
+    return any(lines[i:i + size] == wanted for i in range(len(lines) - size + 1))
 
 
 def apply_edit(text, search, replace):
@@ -960,13 +980,28 @@ class Workspace:
 
         old = self.load(path)[0]
         new = old
+        applied = 0
 
         for number, (search, replace) in enumerate(blocks, 1):
             try:
                 new = apply_edit(new, search, replace)
             except ToolError as error:
+                # Its old text is gone and its new text is there: this block
+                # went in on an earlier turn. A small model that lost track
+                # of that retries it forever, so say so instead of failing.
+                if has_lines(new, replace) and not has_lines(new, search):
+                    applied += 1
+                    continue
+
                 where = " (block {} of {})".format(number, len(blocks)) if len(blocks) > 1 else ""
                 raise ToolError("{}{}".format(error, where))
+
+        if new == old and applied:
+            raise AlreadyDone(
+                "this change is already in the file: the REPLACE text is there "
+                "and the SEARCH text is gone. It was applied earlier. Do not "
+                "edit this again"
+            )
 
         if new == old:
             raise ToolError(
