@@ -41,30 +41,67 @@ class Engine:
 
     name = "llama.cpp"
 
-    def __init__(self):
+    def __init__(self, spec=None):
+        # Which model: a slot from config.model_slots().
+        self.spec = spec or config.model_slots()["general"]
         self.server = None
         self.client = None
         self.plan = None
         self.model_path = None
+        self.executable = None
         self._start_lock = threading.Lock()
         self._best_speed = 0.0
 
     # -- lifecycle --------------------------------------------
 
     def load(self):
-        self.model_path = runtime.ensure_model()
+        self.prepare()
+        self.start()
+
+    def prepare(self):
+        """Fetch the weights and llama-server if missing. Loads nothing."""
+
+        self.model_path = runtime.ensure_model(self.spec)
+
+        if self.executable is None:
+            has_gpu = planner.make_plan(self.model_path)["gpu"] is not None
+            self.executable = runtime.ensure_server(has_gpu)
+
+    def start(self):
+        """Load the model onto the GPU.
+
+        Planned here rather than in prepare(): the context the card affords
+        depends on what else holds VRAM right now, and with two models that
+        is whether the other one has been stopped yet.
+        """
+
         self.plan = planner.make_plan(self.model_path)
 
-        executable = runtime.ensure_server(self.plan["gpu"] is not None)
-
         self._report_plan()
-        self._start(executable)
+        self._start(self.executable)
 
         # Half the window for the conversation, half for the answer. The
-        # answer is further limited, per turn, to what the prompt leaves.
+        # answer is further limited, per turn, to what the prompt leaves. A
+        # budget lowered in the settings is kept across a model swap.
         context = self.plan["context"]
+        first = not getattr(config, "_BUDGETS_SET", False)
         config.MAX_PROMPT_TOKENS = context // 2
-        config.MAX_TOTAL_NEW_TOKENS = context // 2
+        config.MAX_TOTAL_NEW_TOKENS = (
+            context // 2 if first else min(config.MAX_TOTAL_NEW_TOKENS, context // 2)
+        )
+        config._BUDGETS_SET = True
+
+    def stop(self):
+        """Unload the model and free its VRAM. start() brings it back."""
+
+        if self.server is not None:
+            self.server.stop()
+
+        self.server = None
+        self.client = None
+
+    def running(self):
+        return self.server is not None and self.server.alive()
 
     def _report_plan(self):
         plan = self.plan
@@ -87,7 +124,7 @@ class Engine:
         ))
 
     def _start(self, executable):
-        self.server = LlamaServer(executable, self.model_path, self.plan)
+        self.server = LlamaServer(executable, self.model_path, self.plan, alias=self.spec["id"])
         self.client = Client(self.server.port, self.server.key)
 
         print("Loading model...", end="", flush=True)
@@ -113,11 +150,16 @@ class Engine:
             if self.server is not None and self.server.alive():
                 return
 
-            executable = self.server.executable
+            if self.server is None:
+                # Stopped on purpose, for the other model. The caller swaps
+                # it back in with start(); this is the fallback.
+                self.start()
+                return
+
             self.server.stop()
 
             print("\n[llama-server stopped -- restarting]")
-            self._start(executable)
+            self._start(self.executable)
 
     def reset(self):
         """Drop the cached prompt, as 'clear' asks."""
@@ -132,8 +174,7 @@ class Engine:
             pass
 
     def close(self):
-        if self.server is not None:
-            self.server.stop()
+        self.stop()
 
     def asleep(self):
         """True when the idle timer has unloaded the model, so the next
@@ -153,6 +194,7 @@ class Engine:
 
         return {
             "backend": self.name,
+            "model": self.spec["id"],
             "device": plan.get("device"),
             "gpu": gpu.get("name"),
             "vram_gb": round(gpu.get("total_gib", 0.0), 2),

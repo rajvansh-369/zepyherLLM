@@ -17,6 +17,8 @@ export interface Throttled {
 
 /** The `zypher` object on a finished answer. */
 export interface Meta {
+  /** Id of the model that wrote this answer. */
+  model?: string;
   sampling: string;
   live: boolean;
   sources: Source[];
@@ -68,7 +70,20 @@ export interface Health {
   context?: number | null;
   gpu_layers?: string | null;
   kv_cache?: string | null;
+  /** Id of the model on the GPU. */
+  model?: string;
+  models?: ModelInfo[];
+  /** Slot being loaded after a switch in the settings, or null. */
+  switching?: Slot | null;
   auth: boolean;
+}
+
+export type Slot = "general" | "code";
+
+export interface ModelInfo {
+  slot: Slot;
+  id: string;
+  active: boolean;
 }
 
 export interface Settings {
@@ -76,6 +91,11 @@ export interface Settings {
   memory: boolean;
   max_tokens: number;
   max_prompt_tokens: number;
+  /** The slot loaded now. */
+  model: Slot;
+  models: ModelInfo[];
+  switching: Slot | null;
+  switch_error: string | null;
 }
 
 export interface MemoryStats {

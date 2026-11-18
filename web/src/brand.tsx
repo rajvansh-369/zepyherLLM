@@ -16,9 +16,10 @@ export function Logo({ size = 28 }: { size?: number }) {
     >
       <defs>
         <linearGradient id={id} x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stopColor="#6366F1" />
-          <stop offset="0.6" stopColor="#8B5CF6" />
-          <stop offset="1" stopColor="#22D3EE" />
+          {/* Colours follow the model theme (styles.css, data-model). */}
+          <stop offset="0" style={{ stopColor: "var(--logo-1, #6366F1)" }} />
+          <stop offset="0.6" style={{ stopColor: "var(--logo-2, #8B5CF6)" }} />
+          <stop offset="1" style={{ stopColor: "var(--logo-3, #22D3EE)" }} />
         </linearGradient>
       </defs>
       <rect width="32" height="32" rx="9" fill={`url(#${id})`} />

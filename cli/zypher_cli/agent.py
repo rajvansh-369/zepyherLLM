@@ -42,6 +42,7 @@ SERVER_PROMPT_TOKENS = 450
 STAGES = {
     "searching": "Searching the web",
     "waking": "Loading the model back in",
+    "switching": "Loading the coding model",
     "recalled": "Thinking",
 }
 
@@ -541,6 +542,9 @@ class Agent:
                     memory=False if self.tools else None,
                     sampling=("balanced" if self.vary else "precise") if self.tools else None,
                     max_tokens=self.max_tokens,
+                    # zy always runs on the coding model; the server loads it
+                    # if the web chat left the other one on the GPU.
+                    model="code",
                 )
 
                 finish = None

@@ -41,7 +41,14 @@ class Assistant:
     """
 
     def __init__(self):
-        self.engine = None
+        # One engine per configured model slot ("general", and "code" when
+        # ZYPHER_CODE_MODEL_PATH is set). Only the selected one is loaded:
+        # two 7B models do not fit a 6 GB card, and swapping per question
+        # cost a minute or more on a hard disk. See switch().
+        self.engines = {}
+        self.active = "general"
+        self.switching = None     # the slot being loaded by switch(), if any
+        self.switch_error = None  # why the last switch failed, if it did
         self.store = None
         self.lock = threading.Lock()
         self.ready = threading.Event()
@@ -55,17 +62,24 @@ class Assistant:
     # -- lifecycle --------------------------------------------
 
     def load(self):
-        """Fetch what is missing and load the model. Blocks: seconds once
-        everything is on disk, a download's worth the first time."""
+        """Fetch what is missing and load the selected model. Blocks: seconds
+        once everything is on disk, a download's worth the first time."""
 
         try:
             # Constructed first: it loads its encoder on a background thread,
             # and the model load below covers that for free.
             self.store = memory_store.Memory()
 
-            engine = llm.create_engine()
-            self.engine = engine
-            engine.load()
+            slots = config.model_slots()
+
+            if not llm.can_swap():
+                slots = {"general": slots["general"]}
+
+            self.engines = {slot: llm.create_engine(spec) for slot, spec in slots.items()}
+
+            chosen = config.selected_model()
+            self.active = chosen if chosen in self.engines else "general"
+            self.engines[self.active].load()
 
             self.ready.set()
 
@@ -73,9 +87,83 @@ class Assistant:
             self.error = error
             raise
 
+    @property
+    def engine(self):
+        """The engine of the model loaded now."""
+
+        return self.engines.get(self.active)
+
+    def models(self):
+        """[{"slot", "id", "active"}] for each configured model."""
+
+        loaded = self.engines or {"general": None}
+
+        return [
+            {"slot": slot, "id": spec["id"], "active": slot == self.active}
+            for slot, spec in config.model_slots().items()
+            if slot in loaded
+        ]
+
+    def switch(self, slot, save=True):
+        """Unload the current model and load slot's in its place. Blocks for
+        the load; run it off the event loop. With save, the choice is kept,
+        so the next start loads the same model.
+
+        Waits for an answer in progress to finish first. If the new model
+        will not load, the previous one is loaded back and switch_error says
+        why.
+        """
+
+        if slot not in self.engines:
+            raise ValueError("no model {!r} is configured".format(slot))
+
+        with self.lock:
+            if slot == self.active:
+                self.switching = None
+                return
+
+            previous = self.active
+            self.switching = slot
+            self.switch_error = None
+
+            try:
+                self.engines[previous].stop()
+
+                try:
+                    self.engines[slot].load()
+                except Exception as error:
+                    print("[could not load the {} model: {}; loading {} back]".format(
+                        slot, error, previous))
+                    self.switch_error = "{}: {}".format(type(error).__name__, error)
+                    self.engines[slot].stop()
+                    self.engines[previous].start()
+                    return
+
+                self.active = slot
+                self._last_grounded = None
+                if save:
+                    config.save_selected_model(slot)
+
+            finally:
+                self.switching = None
+
+    def _slot_named(self, model):
+        """The configured slot a request's model field names, or None."""
+
+        name = (model or "").strip().lower()
+
+        for slot, spec in config.model_slots().items():
+            if slot in self.engines and name in (slot, spec["id"].lower()):
+                return slot
+
+        return None
+
     def status(self):
         if self.error is not None:
             return "error"
+
+        if self.switching is not None:
+            return "loading"
 
         return "ready" if self.ready.is_set() else "loading"
 
@@ -90,8 +178,8 @@ class Assistant:
     def close(self):
         """Release the model. The views call this on the way out."""
 
-        if self.engine is not None:
-            self.engine.close()
+        for engine in self.engines.values():
+            engine.close()
 
     def engine_info(self):
         """Backend, device and context window, or {} before the load."""
@@ -102,7 +190,7 @@ class Assistant:
 
     def answer(self, messages, web="auto", memory=None, sampling=None,
                temperature=None, top_p=None, max_tokens=None, min_tokens=None,
-               on_event=None):
+               on_event=None, model=None):
         """Answer a conversation. Blocking; call it off the event loop.
 
         messages: [{"role": "system"|"user"|"assistant", "content": str}].
@@ -116,6 +204,10 @@ class Assistant:
         max_tokens: answer budget, capped at config.MAX_TOTAL_NEW_TOKENS.
         min_tokens: no end of turn before this many tokens, capped at the
             answer budget.
+        model: a slot ("general", "code") or model id this request needs.
+            If it is not the one loaded, it is loaded first -- the zy CLI
+            asks for "code". Anything else (None, "auto", an unknown name)
+            answers with the model loaded now.
         on_event(kind, payload): "status" with a dict before generation
             ({"stage": "searching"}, {"stage": "recalled", "count": n}, or
             {"stage": "waking"} when the model has to be loaded back in),
@@ -221,14 +313,22 @@ class Assistant:
         if top_p is not None:
             params["top_p"] = top_p
 
-        budget = min(max_tokens or config.MAX_TOTAL_NEW_TOKENS, config.MAX_TOTAL_NEW_TOKENS)
-
         # An answer about the present goes stale. Recalled later as "what you
         # told this user", it would put last month's price into today's
         # answer, so such exchanges are never stored.
         live = bool(context) or web is True or retrieval.needs_live_data(question)
 
+        wanted = self._slot_named(model)
+
+        if wanted is not None and wanted != self.active:
+            event("status", {"stage": "switching", "model": config.model_slots()[wanted]["id"]})
+            # Not saved: the choice in the settings stays what loads at start.
+            self.switch(wanted, save=False)
+
         with self.lock:
+            # Set by the model just loaded: its context decides the budget.
+            budget = min(max_tokens or config.MAX_TOTAL_NEW_TOKENS, config.MAX_TOTAL_NEW_TOKENS)
+
             # Unloaded for being idle: this answer starts with the model
             # being read back in, and the reader should know why it waits.
             if self.engine.asleep():
@@ -294,6 +394,7 @@ class Assistant:
                 "prompt_tokens_details": {"cached_tokens": reply["cached_tokens"]},
             },
             "meta": {
+                "model": self.engine.spec["id"] if hasattr(self.engine, "spec") else config.MODEL_ID,
                 "sampling": profile,
                 "live": live,
                 "sources": cited or list(sources),

@@ -196,7 +196,7 @@ class Api:
         return self._call("DELETE", "/v1/memory", params={"selector": selector})
 
     def chat(self, messages, **options):
-        """Start a streamed answer. options: web, memory, sampling, max_tokens."""
+        """Start a streamed answer. options: web, memory, sampling, max_tokens, model."""
 
         body = {"messages": messages, "stream": True}
         body.update({key: value for key, value in options.items() if value is not None})

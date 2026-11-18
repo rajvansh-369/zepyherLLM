@@ -63,7 +63,9 @@ async function errorText(response: Response): Promise<string> {
 export const getHealth = () => request<Health>("/health");
 export const getSettings = () => request<Settings>("/v1/settings");
 
-export const patchSettings = (body: Partial<Pick<Settings, "web" | "memory" | "max_tokens">>) =>
+export const patchSettings = (
+  body: Partial<Pick<Settings, "web" | "memory" | "max_tokens" | "model">>,
+) =>
   request<Settings>("/v1/settings", { method: "PATCH", body: JSON.stringify(body) });
 
 // -- memory ----------------------------------------------------------

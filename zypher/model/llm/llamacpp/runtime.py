@@ -26,22 +26,24 @@ def _server_name():
 # WEIGHTS
 # ============================================================
 
-def ensure_model():
-    """Path of the GGUF file, downloading it on first start."""
+def ensure_model(spec=None):
+    """Path of the GGUF file of a model slot (default: the general model),
+    downloading it on first start."""
 
-    path = config.gguf_path()
+    spec = spec or config.model_slots()["general"]
+    path = config.gguf_path(spec)
 
     if os.path.exists(path):
         return path
 
-    if config.MODEL_PATH.lower().endswith(".gguf"):
+    if spec["path"].lower().endswith(".gguf"):
         raise FileNotFoundError(
-            "ZYPHER_MODEL_PATH names {}, which does not exist".format(path)
+            "the model path {} does not exist".format(path)
         )
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    url = fetch.hub_url(config.GGUF_REPO, config.GGUF_FILE)
+    url = fetch.hub_url(spec["repo"], spec["file"])
 
     print("\nDownloading the model (once):")
     print("  from", url)

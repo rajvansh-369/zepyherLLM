@@ -67,6 +67,9 @@ def health(assistant=Depends(assistant_of)):
 
     return dict(
         info,
+        # Every configured model; "active" is the one on the GPU now.
+        models=assistant.models(),
+        switching=assistant.switching,
         status=assistant.status(),
         error=None if assistant.error is None else str(assistant.error),
         auth=config.API_KEY is not None,
@@ -74,36 +77,55 @@ def health(assistant=Depends(assistant_of)):
 
 
 @router.get("/v1/models")
-def models():
+def models(assistant=Depends(assistant_of)):
     return {
         "object": "list",
         "data": [{
-            "id": config.MODEL_ID,
+            "id": model["id"],
             "object": "model",
             "created": 0,
             "owned_by": "local",
-            "root": config.MODEL_NAME,
-        }],
+            "slot": model["slot"],
+            "active": model["active"],
+        } for model in assistant.models()],
     }
 
 
-def current_settings():
+def current_settings(assistant):
     return {
         "web": config.RETRIEVAL_ENABLED,
         "memory": config.MEMORY_ENABLED,
         "max_tokens": config.MAX_TOTAL_NEW_TOKENS,
         "max_prompt_tokens": config.MAX_PROMPT_TOKENS,
+        "model": assistant.active,
+        "models": assistant.models(),
+        "switching": assistant.switching,
+        "switch_error": assistant.switch_error,
     }
 
 
 @router.get("/v1/settings")
-def get_settings():
-    return current_settings()
+def get_settings(assistant=Depends(assistant_of)):
+    return current_settings(assistant)
 
 
 @router.patch("/v1/settings")
-def patch_settings(body: SettingsRequest):
+def patch_settings(body: SettingsRequest, assistant=Depends(assistant_of)):
     """Server-wide defaults: what a request gets when it does not say."""
+
+    if body.model is not None and body.model != assistant.active:
+        if body.model not in assistant.engines:
+            raise HTTPException(
+                400, "no {} model is configured -- set ZYPHER_CODE_MODEL_PATH".format(body.model)
+            )
+
+        if assistant.status() != "ready":
+            raise HTTPException(409, "a model is still loading -- try again when it is ready")
+
+        # The load takes up to a minute: answer now, and let /health say
+        # "loading" until it is done.
+        assistant.switching = body.model
+        threading.Thread(target=assistant.switch, args=(body.model,), daemon=True).start()
 
     if body.web is not None:
         config.RETRIEVAL_ENABLED = body.web
@@ -119,7 +141,7 @@ def patch_settings(body: SettingsRequest):
     if body.max_tokens is not None:
         config.MAX_TOTAL_NEW_TOKENS = body.max_tokens
 
-    return current_settings()
+    return current_settings(assistant)
 
 
 # -- chat -----------------------------------------------------
@@ -143,6 +165,7 @@ async def chat_completions(body: ChatRequest, assistant=Depends(assistant_of)):
         top_p=body.top_p,
         max_tokens=body.max_completion_tokens or body.max_tokens,
         min_tokens=body.min_tokens,
+        model=body.model,
     )
 
     meta = {"id": "chatcmpl-" + uuid.uuid4().hex, "created": int(time.time())}
@@ -167,7 +190,7 @@ async def chat_completions(body: ChatRequest, assistant=Depends(assistant_of)):
         "id": meta["id"],
         "object": "chat.completion",
         "created": meta["created"],
-        "model": config.MODEL_ID,
+        "model": result["meta"]["model"],
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": result["text"]},

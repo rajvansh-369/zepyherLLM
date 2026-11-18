@@ -249,6 +249,7 @@ function AssistantMessage({
 
           {usage && usage.completion_tokens > 0 && meta && (
             <span className="stats" title={details(message)}>
+              {meta.model && <>{meta.model} · </>}
               {usage.completion_tokens} tokens · {meta.tokens_per_second.toFixed(1)} tok/s ·{" "}
               {meta.seconds.toFixed(1)}s{message.stopped ? " · stopped" : ""}
             </span>
@@ -265,6 +266,7 @@ function details({ meta, usage }: Message): string {
   const cached = usage.prompt_tokens_details?.cached_tokens ?? 0;
 
   return [
+    ...(meta.model ? [`Model: ${meta.model}`] : []),
     `Prompt: ${usage.prompt_tokens} tokens (${cached} already cached)`,
     `Style: ${meta.sampling}`,
     `Memories recalled: ${meta.recalled}`,

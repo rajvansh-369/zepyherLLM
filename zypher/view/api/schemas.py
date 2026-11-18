@@ -37,7 +37,10 @@ class ChatRequest(BaseModel):
     # an existing client does not have to be trimmed down to talk to this.
     model_config = ConfigDict(extra="ignore")
 
-    model: str = config.MODEL_ID
+    # Left out, or a name not served here: the model loaded now answers.
+    # "general" / "code" or a model id: that model, loaded first if needed
+    # (the zy CLI sends "code").
+    model: Optional[str] = None
     messages: List[Message] = Field(min_length=1)
     stream: bool = False
     max_tokens: Optional[int] = Field(default=None, ge=1)
@@ -73,3 +76,6 @@ class SettingsRequest(BaseModel):
     web: Optional[bool] = None
     memory: Optional[bool] = None
     max_tokens: Optional[int] = Field(default=None, ge=1)
+    # The model to load: "general" or "code". Loading takes up to a minute;
+    # /health reports "loading" until it is done.
+    model: Optional[Literal["general", "code"]] = None

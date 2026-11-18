@@ -40,16 +40,29 @@ from .sampling import pick_sampling
 from .text import ClientGone, OutOfMemory, PromptTooLong, clean_reply, system_prompt
 
 
-def create_engine():
-    """The engine named by ZYPHER_BACKEND."""
+def create_engine(spec=None):
+    """The engine named by ZYPHER_BACKEND, for one model slot (default: the
+    general model). Only llama.cpp runs a second, coding model."""
 
     if config.BACKEND == "transformers":
-        from .hf import Engine
-    elif config.BACKEND in ("llamacpp", "llama.cpp", "llama-cpp", "gguf"):
-        from .llamacpp import Engine
-    else:
-        raise ValueError(
-            "ZYPHER_BACKEND is {!r}; use 'llamacpp' or 'transformers'".format(config.BACKEND)
-        )
+        if spec is not None and spec["slot"] != "general":
+            raise ValueError("a second (coding) model needs ZYPHER_BACKEND=llamacpp")
 
-    return Engine()
+        from .hf import Engine
+
+        return Engine()
+
+    if config.BACKEND in ("llamacpp", "llama.cpp", "llama-cpp", "gguf"):
+        from .llamacpp import Engine
+
+        return Engine(spec)
+
+    raise ValueError(
+        "ZYPHER_BACKEND is {!r}; use 'llamacpp' or 'transformers'".format(config.BACKEND)
+    )
+
+
+def can_swap():
+    """Whether the engine can stop and start models on demand."""
+
+    return config.BACKEND in ("llamacpp", "llama.cpp", "llama-cpp", "gguf")

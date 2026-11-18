@@ -103,10 +103,11 @@ def _kill_with_parent(process):
 
 class LlamaServer:
 
-    def __init__(self, executable, model_path, plan):
+    def __init__(self, executable, model_path, plan, alias=None):
         self.executable = executable
         self.model_path = model_path
         self.plan = plan
+        self.alias = alias or config.MODEL_ID
         self.port = _free_port()
         self.key = secrets.token_urlsafe(24)
         self.process = None
@@ -122,7 +123,7 @@ class LlamaServer:
             "--model", self.model_path,
             "--host", "127.0.0.1",
             "--port", str(self.port),
-            "--alias", config.MODEL_ID,
+            "--alias", self.alias,
             "--ctx-size", str(plan["context"]),
             "--gpu-layers", str(plan["gpu_layers"]),
             # With the layers decided here, llama.cpp is not to second-guess

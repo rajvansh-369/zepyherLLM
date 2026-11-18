@@ -176,11 +176,15 @@ export default function App() {
 
   // -- health --------------------------------------------------------
 
+  // Checks health at once, e.g. right after the model was switched.
+  const pollNow = useRef<() => void>(() => {});
+
   useEffect(() => {
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
 
     const poll = async () => {
+      clearTimeout(timer);
       let next = 3000;
       try {
         const h = await api.getHealth();
@@ -194,12 +198,25 @@ export default function App() {
       if (!stopped) timer = setTimeout(poll, next);
     };
 
+    pollNow.current = poll;
     poll();
     return () => {
       stopped = true;
       clearTimeout(timer);
     };
   }, []);
+
+  // The look follows the model: Zypher (the general model) gets the red,
+  // hard-edged theme, any other model the soft one. While a switch loads,
+  // it already shows the model being loaded.
+  const slot = health?.switching ?? health?.models?.find((m) => m.active)?.slot ?? null;
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (slot === "general") root.dataset.model = "zypher";
+    else if (slot) root.dataset.model = "soft";
+    else delete root.dataset.model;
+  }, [slot]);
 
   const ready = health?.status === "ready";
   const notReadyReason = offline
@@ -490,6 +507,7 @@ export default function App() {
 
   const status = offline ? "error" : (health?.status ?? "loading");
   const gpu = health?.gpu?.replace(/^NVIDIA GeForce /, "").replace(/ Laptop GPU$/, "");
+  const modelName = health?.model ?? health?.models?.find((m) => m.active)?.id ?? "zypherLL";
   const modelSub = offline
     ? "Offline"
     : health?.status === "ready"
@@ -579,11 +597,11 @@ export default function App() {
           <button
             className="model-pill"
             title="Engine details"
-            aria-label={`zephyr-7b, ${modelSub}. Open engine details`}
+            aria-label={`${modelName}, ${modelSub}. Open engine details`}
             onClick={() => setSettings("server")}
           >
             <span className={"dot " + status} />
-            <span className="model-name">zephyr-7b</span>
+            <span className="model-name">{modelName}</span>
             {modelSub && <span className="model-sub">{modelSub}</span>}
             <ChevronDown size={14} />
           </button>
@@ -610,7 +628,9 @@ export default function App() {
             <div className="banner" role="status">
               <LoaderCircle size={16} className="spin" />
               <span>
-                Loading the model. The first load after a restart can take a minute or two.
+                {health?.switching
+                  ? `Switching to ${health.models?.find((m) => m.slot === health.switching)?.id ?? "the other model"}. This takes up to a minute.`
+                  : "Loading the model. The first load after a restart can take a minute or two."}
               </span>
             </div>
           ) : null}
@@ -634,7 +654,7 @@ export default function App() {
                   What can I <span className="grad">help with?</span>
                 </h1>
                 <p>
-                  Zephyr 7B running on your own GPU, with live web lookup and memory. Nothing
+                  {modelName} running on your own GPU, with live web lookup and memory. Nothing
                   leaves your machine except search queries.
                 </p>
               </div>
@@ -692,6 +712,7 @@ export default function App() {
           initialTab={settings}
           health={health}
           offline={offline}
+          onModelChange={() => pollNow.current()}
           onClose={() => setSettings(null)}
         />
       )}

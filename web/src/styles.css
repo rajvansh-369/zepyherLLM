@@ -187,6 +187,128 @@
 }
 
 /* ============================================================
+   MODEL THEMES -- set by App on <html data-model>
+   zypher: the general model. Red, hard-edged, high contrast.
+   soft:   any other model. Calm teal, rounder, gentler.
+   ============================================================ */
+
+:root[data-model="zypher"] {
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --r-xl: 12px;
+
+  --grad: linear-gradient(135deg, #dc2626 0%, #991b1b 60%, #f97316 130%);
+  --grad-btn: linear-gradient(135deg, #dc2626 0%, #991b1b 100%);
+  --grad-text: linear-gradient(120deg, #b91c1c 0%, #dc2626 50%, #ea580c 100%);
+  --logo-1: #ef4444;
+  --logo-2: #991b1b;
+  --logo-3: #f97316;
+
+  --accent: #dc2626;
+  --accent-solid: #b91c1c;
+  --accent-text: #b91c1c;
+  --accent-soft: #fef2f2;
+  --accent-border: #fca5a5;
+  --user-bubble: #fef2f2;
+  --user-bubble-border: #fecaca;
+
+  --ring: 0 0 0 3px rgb(220 38 38 / 0.25);
+  --glow: 0 6px 20px rgb(220 38 38 / 0.45);
+  --aurora-1: rgb(220 38 38 / 0.16);
+  --aurora-2: rgb(153 27 27 / 0.12);
+  --aurora-3: rgb(249 115 22 / 0.08);
+}
+
+:root[data-model="zypher"][data-theme="dark"] {
+  --frame: #030303;
+  --bg: #070606;
+  --surface: #100c0c;
+  --surface-2: #181111;
+  --surface-3: #221616;
+  --raised: #2c1c1c;
+  --border: rgb(248 113 113 / 0.12);
+  --border-strong: rgb(248 113 113 / 0.24);
+
+  --accent: #ef4444;
+  --accent-solid: #dc2626;
+  --accent-text: #fca5a5;
+  --accent-soft: rgb(239 68 68 / 0.14);
+  --accent-border: rgb(248 113 113 / 0.4);
+  --grad-text: linear-gradient(120deg, #fca5a5 0%, #ef4444 50%, #fb923c 100%);
+  --user-bubble: #2a1111;
+  --user-bubble-border: rgb(248 113 113 / 0.25);
+
+  --ring: 0 0 0 3px rgb(239 68 68 / 0.35);
+  --glow: 0 6px 22px rgb(239 68 68 / 0.55);
+  --aurora-1: rgb(239 68 68 / 0.2);
+  --aurora-2: rgb(127 29 29 / 0.22);
+  --aurora-3: rgb(249 115 22 / 0.08);
+}
+
+:root[data-model="soft"] {
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 20px;
+  --r-xl: 28px;
+
+  --grad: linear-gradient(135deg, #14b8a6 0%, #60a5fa 70%, #a78bfa 130%);
+  --grad-btn: linear-gradient(135deg, #14b8a6 0%, #3b82f6 100%);
+  --grad-text: linear-gradient(120deg, #0f766e 0%, #2563eb 60%, #7c3aed 100%);
+  --logo-1: #2dd4bf;
+  --logo-2: #60a5fa;
+  --logo-3: #a78bfa;
+
+  --accent: #14b8a6;
+  --accent-solid: #0f766e;
+  --accent-text: #0f766e;
+  --accent-soft: #f0fdfa;
+  --accent-border: #99f6e4;
+  --user-bubble: #f0fdfa;
+  --user-bubble-border: #ccfbf1;
+
+  --ring: 0 0 0 4px rgb(20 184 166 / 0.16);
+  --glow: 0 6px 18px rgb(20 184 166 / 0.3);
+  --aurora-1: rgb(20 184 166 / 0.12);
+  --aurora-2: rgb(96 165 250 / 0.1);
+  --aurora-3: rgb(167 139 250 / 0.08);
+}
+
+:root[data-model="soft"][data-theme="dark"] {
+  --frame: #070a0c;
+  --bg: #0b1013;
+  --surface: #11181c;
+  --surface-2: #172125;
+  --surface-3: #1e2a2f;
+  --raised: #263439;
+  --border: rgb(153 246 228 / 0.08);
+  --border-strong: rgb(153 246 228 / 0.15);
+
+  --accent: #2dd4bf;
+  --accent-solid: #0d9488;
+  --accent-text: #5eead4;
+  --accent-soft: rgb(45 212 191 / 0.12);
+  --accent-border: rgb(94 234 212 / 0.3);
+  --grad-text: linear-gradient(120deg, #5eead4 0%, #93c5fd 60%, #c4b5fd 100%);
+  --user-bubble: #13252a;
+  --user-bubble-border: rgb(94 234 212 / 0.2);
+
+  --ring: 0 0 0 4px rgb(45 212 191 / 0.2);
+  --glow: 0 6px 20px rgb(45 212 191 / 0.3);
+  --aurora-1: rgb(45 212 191 / 0.1);
+  --aurora-2: rgb(96 165 250 / 0.08);
+  --aurora-3: rgb(167 139 250 / 0.06);
+}
+
+/* Zypher's headings and buttons speak louder. */
+:root[data-model="zypher"] .welcome h1,
+:root[data-model="zypher"] .model-name {
+  letter-spacing: -0.03em;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+/* ============================================================
    BASE
    ============================================================ */
 
@@ -1026,7 +1148,7 @@ kbd {
 .welcome .logo-mark {
   margin: 0 auto 22px;
   border-radius: 18px;
-  box-shadow: 0 14px 40px rgb(99 102 241 / 0.35);
+  box-shadow: 0 14px 40px var(--aurora-1);
 }
 
 .welcome h1 {
@@ -2130,6 +2252,85 @@ dialog.sheet::backdrop {
 
 .field-row .btn {
   height: 40px;
+}
+
+/* -- Model picker ------------------------------------------------ */
+
+.model-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px;
+  margin: 12px 0 8px;
+}
+
+.model-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast) ease-out,
+    box-shadow var(--dur-fast) ease-out;
+}
+
+.model-card:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.model-card:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+/* The other model while a load is under way. */
+.model-card[aria-checked="false"]:disabled {
+  opacity: 0.55;
+}
+
+.model-card[aria-checked="true"] {
+  border-color: var(--accent);
+  box-shadow: var(--ring);
+}
+
+.model-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.model-card strong {
+  font-size: 15px;
+}
+
+/* Each card previews its own theme's colour, whatever is loaded now. */
+.model-card.general strong {
+  color: #dc2626;
+}
+
+.model-card.code strong {
+  color: #0d9488;
+}
+
+.model-card small {
+  color: var(--text-2);
+  line-height: 1.45;
+}
+
+.model-card code {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.model-card .tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 /* -- About me ---------------------------------------------------- */

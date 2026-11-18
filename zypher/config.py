@@ -11,6 +11,7 @@ PATCH /v1/settings). Code reads those as config.NAME rather than importing the
 value, so every module sees the change.
 """
 
+import json
 import os
 
 
@@ -61,8 +62,9 @@ API_KEY = os.environ.get("ZYPHER_API_KEY") or None
 HOST = os.environ.get("ZYPHER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ZYPHER_PORT", "8000"))
 
-# The name clients pass as "model". There is only one; set ZYPHER_MODEL_ID
-# when the GGUF below is another model, so /v1/models says which.
+# The name clients pass as "model" for the general model; set ZYPHER_MODEL_ID
+# when the GGUF below is another model, so /v1/models says which. The coding
+# model, if any, has CODE_MODEL_ID.
 MODEL_ID = os.environ.get("ZYPHER_MODEL_ID", "zephyr-7b")
 
 
@@ -102,11 +104,72 @@ GGUF_FILE = os.environ.get(
 )
 
 
-def gguf_path():
-    if MODEL_PATH.lower().endswith(".gguf"):
-        return MODEL_PATH
+# A second model for coding, optional. When ZYPHER_CODE_MODEL_PATH is set,
+# coding questions -- and every request from the zy CLI -- go to it, and the
+# rest to the model above. Two 7B models do not fit a 6 GB card together, so
+# one is on the GPU at a time and a question for the other swaps them: a few
+# seconds while both files sit in the OS file cache.
+CODE_MODEL_PATH = os.environ.get("ZYPHER_CODE_MODEL_PATH", "").strip()
+CODE_GGUF_REPO = os.environ.get(
+    "ZYPHER_CODE_GGUF_REPO", "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF"
+)
+CODE_GGUF_FILE = os.environ.get(
+    "ZYPHER_CODE_GGUF_FILE", "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
+)
+CODE_MODEL_ID = os.environ.get("ZYPHER_CODE_MODEL_ID", "qwen2.5-coder-7b")
 
-    return os.path.join(MODEL_PATH, GGUF_FILE)
+
+def model_slots():
+    """The models this server runs, by slot: "general", and "code" if set.
+
+    Each is {"slot", "id", "path", "repo", "file"}. "general" comes first and
+    is the one loaded at start.
+    """
+
+    slots = {
+        "general": {"slot": "general", "id": MODEL_ID, "path": MODEL_PATH,
+                    "repo": GGUF_REPO, "file": GGUF_FILE},
+    }
+
+    if CODE_MODEL_PATH:
+        slots["code"] = {"slot": "code", "id": CODE_MODEL_ID, "path": CODE_MODEL_PATH,
+                         "repo": CODE_GGUF_REPO, "file": CODE_GGUF_FILE}
+
+    return slots
+
+
+# Which slot is loaded at start: the one last chosen in the web settings,
+# saved here. Machine state, not configuration, so it is git-ignored.
+STATE_FILE = os.path.join(PROJECT_ROOT, ".zypher-state.json")
+
+
+def selected_model():
+    """The slot chosen last, or "general"."""
+
+    try:
+        with open(STATE_FILE, encoding="utf-8") as handle:
+            slot = json.load(handle).get("model")
+    except (OSError, ValueError, AttributeError):
+        return "general"
+
+    return slot if slot in model_slots() else "general"
+
+
+def save_selected_model(slot):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as handle:
+            json.dump({"model": slot}, handle)
+    except OSError as error:
+        print("[could not save the model choice: {}]".format(error))
+
+
+def gguf_path(spec=None):
+    spec = spec or model_slots()["general"]
+
+    if spec["path"].lower().endswith(".gguf"):
+        return spec["path"]
+
+    return os.path.join(spec["path"], spec["file"])
 
 
 def _models_root():

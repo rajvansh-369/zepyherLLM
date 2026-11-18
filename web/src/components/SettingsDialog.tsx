@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { CircleAlert, CircleCheck, Cpu, History, IdCard, Trash2, UserRound, X } from "lucide-react";
+import {
+  CircleAlert,
+  CircleCheck,
+  Cpu,
+  History,
+  IdCard,
+  LoaderCircle,
+  Trash2,
+  UserRound,
+  X,
+} from "lucide-react";
 import * as api from "../api";
-import type { About, Health, MemoryRecord, MemoryStats, Settings } from "../types";
+import type { About, Health, MemoryRecord, MemoryStats, Settings, Slot } from "../types";
 
 export type SettingsTab = "about" | "notes" | "exchanges" | "server";
 
@@ -9,8 +19,23 @@ interface Props {
   initialTab: SettingsTab;
   health: Health | null;
   offline: string | null;
+  /** A model switch was started: check health now rather than on the timer. */
+  onModelChange: () => void;
   onClose: () => void;
 }
+
+// How each slot is presented. The ids come from the API (ZYPHER_MODEL_ID,
+// ZYPHER_CODE_MODEL_ID); these are the names and what each is for.
+const SLOT_INFO: Record<Slot, { name: string; text: string }> = {
+  general: {
+    name: "Zypher",
+    text: "Unfiltered general model, fully on the GPU. Fast, direct answers. Red theme.",
+  },
+  code: {
+    name: "Coder",
+    text: "Coding model for code, debugging and the zy CLI. Soft theme.",
+  },
+};
 
 const TABS = [
   { id: "about", label: "About me", icon: IdCard },
@@ -19,7 +44,7 @@ const TABS = [
   { id: "server", label: "Engine", icon: Cpu },
 ] as const;
 
-export function SettingsDialog({ initialTab, health, offline, onClose }: Props) {
+export function SettingsDialog({ initialTab, health, offline, onModelChange, onClose }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [tab, setTab] = useState<SettingsTab>(initialTab);
   const [stats, setStats] = useState<MemoryStats | null>(null);
@@ -78,7 +103,7 @@ export function SettingsDialog({ initialTab, health, offline, onClose }: Props) 
     }
   };
 
-  const update = (body: Partial<Pick<Settings, "web" | "memory" | "max_tokens">>) =>
+  const update = (body: Partial<Pick<Settings, "web" | "memory" | "max_tokens" | "model">>) =>
     run(async () => setSettings(await api.patchSettings(body)));
 
   return (
@@ -194,13 +219,61 @@ export function SettingsDialog({ initialTab, health, offline, onClose }: Props) 
 
         {tab === "server" && (
           <>
+            {(health?.models?.length ?? 0) > 1 && (
+              <>
+                <h3 className="section-title">Model</h3>
+                <p className="muted">
+                  One model is loaded at a time, fully on the GPU, for the best speed. Switching
+                  takes up to a minute; your choice is kept after a restart.
+                </p>
+                <div className="model-cards" role="radiogroup" aria-label="Model">
+                  {health!.models!.map((m) => {
+                    const info = SLOT_INFO[m.slot];
+                    const loading = health?.switching === m.slot;
+                    const busy = !!health?.switching || health?.status !== "ready";
+
+                    return (
+                      <button
+                        key={m.slot}
+                        role="radio"
+                        aria-checked={m.active}
+                        className={"model-card " + m.slot}
+                        disabled={busy || m.active}
+                        onClick={() =>
+                          run(async () => {
+                            await api.patchSettings({ model: m.slot });
+                            onModelChange();
+                          }, `Loading ${m.id}…`)
+                        }
+                      >
+                        <span className="model-card-head">
+                          <strong>{info.name}</strong>
+                          {m.active && !health?.switching && <span className="tag">Loaded</span>}
+                          {loading && (
+                            <span className="tag">
+                              <LoaderCircle size={12} className="spin" /> Loading
+                            </span>
+                          )}
+                        </span>
+                        <small>{info.text}</small>
+                        <code>{m.id}</code>
+                      </button>
+                    );
+                  })}
+                </div>
+                {settings?.switch_error && (
+                  <p className="muted">Last switch failed: {settings.switch_error}</p>
+                )}
+              </>
+            )}
+
             <h3 className="section-title">Engine</h3>
             <dl className="engine">
               <Fact label="Status">
                 <span className={"dot " + (offline ? "error" : (health?.status ?? "loading"))} />
                 {offline ? "Offline" : health ? capitalize(health.status) : "Checking…"}
               </Fact>
-              <Fact label="Model">zephyr-7b</Fact>
+              {health?.model && <Fact label="Model">{health.model}</Fact>}
               {health?.backend && <Fact label="Runtime">{health.backend}</Fact>}
               {health?.gpu && (
                 <Fact label="GPU">
